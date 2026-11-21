@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     if (!relay::parseConfig(argc, argv, config)) return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 2; }
   const auto& backend = relay::backendFor(config.backend);
-  if (!backend.initialize(config.output)) { std::cerr << "Native backend initialization failed\n"; return 1; }
+  if (!backend.initialize(config.output, config.fps)) { std::cerr << "Native backend initialization failed\n"; return 1; }
   if (config.check) return 0;
   std::signal(SIGINT, signalStop); std::signal(SIGTERM, signalStop);
   relay::Server s(config);
@@ -36,9 +36,9 @@ int main(int argc, char** argv) {
   }
   try {
     s.input = std::make_unique<relay::InputController>(backend.input());
-    const auto dimensions = s.input->dimensions();
+    const auto dimensions = s.streams[0]->capture.dimensions();
     relay::requireSurfaceSize(dimensions.first, dimensions.second);
-    s.width = dimensions.first; s.height = dimensions.second;
+    s.width = uint16_t(dimensions.first); s.height = uint16_t(dimensions.second);
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; s.streams[0]->capture.stop(); return 1; }
   lws_protocols protocols[] = {{"http", relay::callback, sizeof(relay::HttpResponse), 4096, 0, nullptr, 0}, {"nsl1", relay::callback, sizeof(relay::HttpResponse), 4096, 0, nullptr, 0}, {nullptr, nullptr, 0, 0, 0, nullptr, 0}};
   lws_context_creation_info info{};

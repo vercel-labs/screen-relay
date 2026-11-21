@@ -56,5 +56,5 @@ struct Connection {
   void cleanup();
 };
 
-bool initializeNativeBackend(const std::string& output);
+bool initializeNativeBackend(const std::string& output, unsigned fps);
 }

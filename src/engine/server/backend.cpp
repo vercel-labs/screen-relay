@@ -4,7 +4,7 @@
 namespace relay {
 #ifdef RELAY_BACKEND_x11
 namespace x11 {
-bool initializeNativeBackend(const std::string& output);
+bool initializeNativeBackend(const std::string& output, unsigned fps);
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
@@ -12,7 +12,7 @@ std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
 #endif
 #ifdef RELAY_BACKEND_wayland
 namespace wayland {
-bool initializeNativeBackend(const std::string& output);
+bool initializeNativeBackend(const std::string& output, unsigned fps);
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
@@ -20,7 +20,7 @@ std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
 #endif
 #ifdef RELAY_BACKEND_windows
 namespace windows {
-bool initializeNativeBackend(const std::string& output);
+bool initializeNativeBackend(const std::string& output, unsigned fps);
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
@@ -28,7 +28,7 @@ std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);
 #endif
 #ifdef RELAY_BACKEND_macos
 namespace macos {
-bool initializeNativeBackend(const std::string& output);
+bool initializeNativeBackend(const std::string& output, unsigned fps);
 std::unique_ptr<CaptureSource> makeCaptureSource();
 std::unique_ptr<InputBackend> makeInputBackend();
 std::unique_ptr<ClipboardBackend> makeClipboard(ClipboardChanged changed);

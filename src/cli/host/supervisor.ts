@@ -383,13 +383,21 @@ export class Session {
       try {
         const message = JSON.parse(line);
         if (message.ready === true && message.pid === pid) {
-          const image = Buffer.from(await createClient({
+          const client = createClient({
             url: where.url, token: where.token ?? undefined, certificate: where.certificate ?? undefined, connect: where.connect ?? undefined, timeout: 3000, signal: this.args.signal,
-          }).screenshot());
+          });
+          const image = Buffer.from(await client.screenshot());
           if (!image.subarray(0, 8).equals(PNG)) return false;
           if (this.args.display || attaches(this.data.backend)) {
             if (image.length < 24) return false;
-            this.save({ resolution: `${image.readUInt32BE(16)}x${image.readUInt32BE(20)}` });
+            let resolution = `${image.readUInt32BE(16)}x${image.readUInt32BE(20)}`;
+            try {
+              const caps = await client.capabilities();
+              if (Number.isInteger(caps.width) && caps.width > 0 && Number.isInteger(caps.height) && caps.height > 0) {
+                resolution = `${caps.width}x${caps.height}`;
+              }
+            } catch {}
+            this.save({ resolution });
           }
           return true;
         }

@@ -20,10 +20,9 @@ namespace {
 constexpr size_t max_damage_rects = 64;
 
 void checkSize(int width, int height) {
-  try {
-    requireSurfaceSize(width, height);
-  } catch (const std::runtime_error& error) {
-    throw std::runtime_error(std::string(error.what()) +
+  if (width < min_frame_width || width > max_frame_width ||
+      height < min_frame_height || height > max_frame_height) {
+    throw std::runtime_error("Unsupported root size " + std::to_string(width) + "x" + std::to_string(height) +
       "; create a headless output of a supported size (for example, swaymsg create_output or "
       "hyprctl output create headless <name>) and select it with --output");
   }

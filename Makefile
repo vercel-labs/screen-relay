@@ -43,7 +43,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/engine/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/engine/*/*.hpp src/engine/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/engine/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-input test-backend test-server test-keymap test-macos-keys clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-png-fit test-input test-backend test-server test-keymap test-macos-keys clean FORCE
 all: relay-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -117,6 +117,20 @@ build/cpu-budget-test: tests/unit/cpu-budget-test.cpp src/engine/core/cpu-budget
 test-cpu-budget: build/cpu-budget-test
 	./build/cpu-budget-test
 
+build/surface-budget-test: tests/unit/surface-budget-test.cpp src/engine/core/surface-budget.hpp src/engine/core/image-scale.hpp src/engine/core/scaled-capture.hpp src/engine/core/capture-source.hpp
+	mkdir -p build
+	$(CXX) -Isrc/engine $(CXXFLAGS) tests/unit/surface-budget-test.cpp -o $@
+
+test-surface-budget: build/surface-budget-test
+	./build/surface-budget-test
+
+build/png-fit-test: tests/unit/png-fit-test.cpp src/engine/core/png-fit.hpp src/engine/core/image-scale.hpp src/engine/core/capture-source.hpp
+	mkdir -p build
+	$(CXX) -Isrc/engine $(CXXFLAGS) tests/unit/png-fit-test.cpp -o $@ $(shell pkg-config --cflags --libs zlib)
+
+test-png-fit: build/png-fit-test
+	./build/png-fit-test
+
 build/input-test: tests/unit/input-test.cpp src/engine/core/input.cpp src/engine/core/input.hpp
 	mkdir -p build
 	$(CXX) -Isrc/engine $(CXXFLAGS) tests/unit/input-test.cpp src/engine/core/input.cpp -o $@
@@ -159,7 +173,7 @@ build/macos-keys-test: tests/unit/macos-keys-test.cpp src/engine/backends/macos/
 test-macos-keys: build/macos-keys-test
 	./build/macos-keys-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
+test: test-color test-flow test-capture-bucket test-cpu-budget test-surface-budget test-png-fit test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
 
 clean:
 	rm -rf build relay-engine

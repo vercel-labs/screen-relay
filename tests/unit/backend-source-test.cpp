@@ -264,10 +264,37 @@ static void fullScreenDamage(int width, int height) {
   encoder.stop();
   decodedStripes({initial, changed}, width, height);
 }
+static void scaledSurfaceFitsLevel52(int width, int height, unsigned fps) {
+  auto state = std::make_shared<SourceState>(); Frames frames;
+  relay::CaptureSettings settings = capture_settings;
+  settings.fps = fps;
+  relay::CaptureEncoder encoder([&](relay::EncodedFrame&& f) { return frames.publish(std::move(f)); },
+      settings, [state, width, height] { return std::make_unique<CpuSource>(state, width, height); });
+  std::string error; require(encoder.start(error), error.c_str());
+  const auto stream = encoder.dimensions();
+  require(stream.first < width && stream.second < height, "oversized surface was not scaled down");
+  encoder.beginSession(22);
+  const auto initial = frames.at(0);
+  require(initial.width == stream.first && initial.height == stream.second && initial.keyframe,
+          "scaled initial IDR dimensions mismatch");
+  uint8_t sps_level = 0;
+  const auto& bytes = initial.annex_b;
+  for (size_t i = 0; i + 6 < bytes.size(); ++i) {
+    if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 && (bytes[i + 3] & 31) == 7) {
+      sps_level = bytes[i + 6];
+      break;
+    }
+  }
+  require(sps_level > 0 && sps_level <= 52, "scaled stream SPS level exceeds H.264 level 5.2");
+  decodedPixel(initial, false, stream.first, stream.second);
+  encoder.stop();
+}
 int main() {
   try {
     healthySource(); runtimeSize(1920, 1080); runtimeSize(1366, 768); runtimeSize(3840, 2160);
     runtimeSize(1280, 720, 120);
+    scaledSurfaceFitsLevel52(6016, 3384, 60);
+    scaledSurfaceFitsLevel52(3008, 1692, 120);
     fullScreenDamage(1920, 1080); fullScreenDamage(1366, 768);
     identicalDamageRefines(); invalidSource(1); invalidSource(2);
     std::puts("backend source: decoded fresh IDRs, damage, refinement, idle, shutdown and invalid frames passed");

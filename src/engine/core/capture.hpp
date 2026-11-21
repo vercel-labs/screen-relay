@@ -48,6 +48,8 @@ class CaptureEncoder {
   void acknowledge(uint32_t generation, uint32_t sequence);
   void setFlowControl(uint32_t generation, unsigned window, uint64_t bitrate, bool paused, uint64_t admit_until_us);
   CaptureStats stats() const;
+  /** Returns the stream width and height after fitting the capture surface to the H.264 budget. */
+  std::pair<int, int> dimensions() const;
   std::string error() const;
   void stop();
 
