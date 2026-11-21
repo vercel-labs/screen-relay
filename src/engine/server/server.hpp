@@ -55,7 +55,7 @@ struct Server {
   struct Stream {
     lws* viewer = nullptr;
     std::mutex mutex;
-    std::deque<EncodedFrame> pending;
+    std::deque<std::shared_ptr<const EncodedFrame>> pending;
     std::optional<CursorImage> pending_cursor;
     bool last_write_cursor = false;
     bool clipboard_notices = false, clipboard_pending = false;

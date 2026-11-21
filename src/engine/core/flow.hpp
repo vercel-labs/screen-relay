@@ -12,7 +12,7 @@ struct FlowControl {
   static constexpr size_t max_bytes = 8 * 1024 * 1024;
   static constexpr uint64_t pause_age_us = 250000;
   static constexpr uint64_t timeout_us = 3000000;
-  static constexpr size_t max_frames = timeout_us * 120 / 1000000;
+  static constexpr size_t max_frames = timeout_us * 240 / 1000000;
   static constexpr uint64_t base_window_us = 10000000;
   static constexpr uint64_t viewer_hold_limit_us = 100000;
   enum class Pressure { clear, building, congested, paused };

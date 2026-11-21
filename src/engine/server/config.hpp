@@ -9,7 +9,7 @@
 
 namespace relay {
 struct Config {
-  std::string bind = "127.0.0.1", viewer, token, origin, authority, cert, key, backend, output;
+  std::string bind = "127.0.0.1", viewer, token, origin, authority, cert, key, backend, output, encoder = "auto";
   unsigned port = 8080;
   unsigned fps = 60;
   uint64_t bitrate_min = 1000000, bitrate_start = 8000000, bitrate_max = 40000000;

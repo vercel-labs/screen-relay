@@ -8,6 +8,7 @@ PLATFORM_PKGS = openssl
 endif
 BACKENDS ?= x11
 HAS_WAYLAND = $(filter wayland,$(BACKENDS))
+HAS_MACOS = $(filter macos,$(BACKENDS))
 AVAILABLE_BACKENDS = x11 wayland windows macos
 BACKEND_PKGS_x11 = x11 xext xdamage xfixes xtst
 BACKEND_DIR_x11 = linux/x11
@@ -18,7 +19,7 @@ BACKEND_LIBS_windows = -ld3d11 -ldxgi -lbcrypt
 BACKEND_FLAGS_windows = -DNOMINMAX -D_WIN32_WINNT=0x0A00
 BACKEND_DIR_macos = macos
 BACKEND_FLAGS_macos = -mmacosx-version-min=12.3 -Werror=unguarded-availability-new
-BACKEND_LIBS_macos = -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ApplicationServices -framework AppKit -framework Foundation
+BACKEND_LIBS_macos = -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ApplicationServices -framework AppKit -framework Foundation
 ifneq ($(filter-out $(AVAILABLE_BACKENDS),$(BACKENDS)),)
 $(error Unknown BACKENDS '$(filter-out $(AVAILABLE_BACKENDS),$(BACKENDS))'; available: $(AVAILABLE_BACKENDS))
 endif
@@ -29,21 +30,29 @@ BACKEND_PKGS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_PKGS_$(backend))))
 BACKEND_DIRS = $(sort $(foreach backend,$(BACKENDS),$(BACKEND_DIR_$(backend))))
 BACKEND_CPPFLAGS = $(foreach backend,$(sort $(BACKENDS)),-DRELAY_BACKEND_$(backend) $(BACKEND_FLAGS_$(backend)))
 CODEC_PKGS = x264
+HWENC ?= $(shell pkg-config --exists libavcodec libavutil && echo 1)
+ifeq ($(HWENC),1)
+CODEC_PKGS += libavcodec libavutil
+CODEC_CPPFLAGS += -DRELAY_HWENC
+endif
 PKGS = $(sort $(BACKEND_PKGS) $(CODEC_PKGS) $(PLATFORM_PKGS) libwebsockets zlib)
-CPPFLAGS += -Isrc/engine $(BACKEND_CPPFLAGS) $(shell pkg-config --cflags $(PKGS))
+CPPFLAGS += -Isrc/engine $(BACKEND_CPPFLAGS) $(CODEC_CPPFLAGS) $(shell pkg-config --cflags $(PKGS))
 CXXFLAGS ?= -O2
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -pthread
 BACKEND_LIBS = $(foreach backend,$(BACKENDS),$(BACKEND_LIBS_$(backend)))
 LDLIBS += $(shell pkg-config --libs $(PKGS)) $(BACKEND_LIBS) -pthread
 
 CORE_SRCS = $(wildcard src/engine/core/*.cpp)
+ENCODER_PLATFORM_SRCS = $(if $(HAS_MACOS),src/engine/backends/macos/vt_encoder.mm)
+ENCODER_PLATFORM_FLAGS = $(if $(HAS_MACOS),$(BACKEND_FLAGS_macos) -fobjc-arc) $(if $(filter windows,$(BACKENDS)),$(BACKEND_FLAGS_windows))
+ENCODER_PLATFORM_LIBS = $(if $(HAS_MACOS),-framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation)
 BACKEND_SRCS = $(foreach dir,$(BACKEND_DIRS),$(wildcard src/engine/backends/$(dir)/*.cpp src/engine/backends/$(dir)/*.mm))
 BACKEND_OBJCXXFLAGS = $(if $(filter %.mm,$(BACKEND_SRCS)),-fobjc-arc)
 ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/engine/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/engine/*/*.hpp src/engine/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/engine/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-input test-backend test-server test-keymap test-macos-keys clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-backend test-server test-keymap test-macos-keys clean FORCE
 all: relay-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -124,14 +133,21 @@ build/input-test: tests/unit/input-test.cpp src/engine/core/input.cpp src/engine
 test-input: build/input-test
 	./build/input-test
 
-build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(wildcard src/engine/core/*.hpp)
+build/encoder-state-test: tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
 	mkdir -p build
-	$(CXX) -Isrc/engine $(CXXFLAGS) tests/unit/backend-source-test.cpp $(CORE_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale)
+	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS)) $(ENCODER_PLATFORM_LIBS)
+
+test-encoder-state: build/encoder-state-test
+	./build/encoder-state-test
+
+build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
+	mkdir -p build
+	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale) $(ENCODER_PLATFORM_LIBS)
 
 test-backend: build/backend-source-test
 	./build/backend-source-test
 
-SERVER_TEST_SRCS = src/engine/server/clipboard.cpp src/engine/server/config.cpp src/engine/server/metrics.cpp src/engine/server/wire.cpp src/engine/server/backend.cpp src/engine/core/input.cpp src/engine/core/wait.cpp $(BACKEND_SRCS)
+SERVER_TEST_SRCS = src/engine/server/clipboard.cpp src/engine/server/config.cpp src/engine/server/metrics.cpp src/engine/server/wire.cpp src/engine/server/backend.cpp src/engine/core/input.cpp src/engine/core/wait.cpp $(filter-out src/engine/backends/macos/vt_encoder.mm,$(BACKEND_SRCS))
 
 build/test-viewer/viewer.js:
 	mkdir -p build/test-viewer
@@ -159,7 +175,7 @@ build/macos-keys-test: tests/unit/macos-keys-test.cpp src/engine/backends/macos/
 test-macos-keys: build/macos-keys-test
 	./build/macos-keys-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-input test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
+test: test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
 
 clean:
 	rm -rf build relay-engine

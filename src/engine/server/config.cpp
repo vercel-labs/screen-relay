@@ -294,13 +294,13 @@ bool parseConfig(int argc, char** argv, Config& config) {
     const std::string option = argv[i];
     if (option == "--help") {
       std::cout << "Usage: relay-engine [--bind ADDRESS] [--port PORT] [--viewer-dir DIR]\n"
-                   "  [--backend NAME] [--output NAME] [--check]\n"
+                   "  [--backend NAME] [--output NAME] [--encoder auto|x264|NAME] [--check]\n"
                    "  [--fps N] [--bitrate-min BPS] [--bitrate-start BPS] [--bitrate-max BPS]\n"
                    "  [--token-file FILE [--public-origin https://HOST[:PORT]]\n"
                    "    [--allow-origin ORIGIN[,...]]]\n"
                    "  [--tls-cert FILE --tls-key FILE | --behind-tls-proxy]\n"
                    "  [--insecure-local: unauthenticated, isolated development network only]\n"
-                   "FPS is 10 to 120; bitrates are 250000 to 100000000 bits per second with\n"
+                   "FPS is 10 to 240; bitrates are 250000 to 100000000 bits per second with\n"
                    "min <= start <= max. Non-loopback --bind needs --token-file;\n"
                    "--public-origin also needs TLS or --behind-tls-proxy.\n"
                    "A browser request must come from the public origin, or from a loopback origin\n"
@@ -309,7 +309,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
                    "http://127.0.0.1[:PORT] for a page served on the machine itself.\n"
                    "--check initializes the backend and exits without starting capture or the server.\n"
                    "Attach to DISPLAY using the caller's XAUTHORITY. Defaults: 127.0.0.1:8080, 60 fps,\n"
-                   "1000000/8000000/40000000 bps.\n"
+                   "encoder auto, 1000000/8000000/40000000 bps.\n"
                 << "Compiled backends: " << backendNames() << '\n';
       return false;
     }
@@ -321,14 +321,18 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (option == "--bind") config.bind = value;
     else if (option == "--backend") config.backend = value;
     else if (option == "--output") config.output = value;
-    else if (option == "--port") {
+    else if (option == "--encoder") {
+      if (value.empty() || value.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
+        throw std::runtime_error("Encoder must be auto, x264, or an alphanumeric/underscore name");
+      config.encoder = value;
+    } else if (option == "--port") {
       uint64_t port;
       if (!unsignedNumber(value, port) || !port || port > 65535) throw std::runtime_error("Invalid port");
       config.port = unsigned(port);
     } else if (option == "--fps") {
       uint64_t fps;
-      if (!unsignedNumber(value, fps) || fps < 10 || fps > 120)
-        throw std::runtime_error("FPS must be an integer from 10 to 120");
+      if (!unsignedNumber(value, fps) || fps < 10 || fps > 240)
+        throw std::runtime_error("FPS must be an integer from 10 to 240");
       config.fps = unsigned(fps);
     } else if (option == "--bitrate-min") config.bitrate_min = bitrate(value);
     else if (option == "--bitrate-start") config.bitrate_start = bitrate(value);

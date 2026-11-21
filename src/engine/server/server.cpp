@@ -62,16 +62,16 @@ std::optional<FlowControl::TransportSample> streamTransportSample(lws* wsi, size
 }
 #endif
 }  // namespace
-Server::Stream::Stream(Server& server) : capture([this, &server](EncodedFrame&& frame) {
+Server::Stream::Stream(Server& server) : capture([this, &server](std::shared_ptr<const EncodedFrame> frame) {
   std::lock_guard<std::mutex> lock(mutex);
-  if (!generation || frame.generation != generation) return false;
-  if (!flow.enqueue(frame.sequence, frame.annex_b.size(), frame.pts_us, nowUs())) {
+  if (!generation || frame->generation != generation) return false;
+  if (!flow.enqueue(frame->sequence, frame->annex_b.size(), frame->pts_us, nowUs())) {
     failed = true; lws_cancel_service(server.context); return false;
   }
   pending.push_back(std::move(frame));
   lws_cancel_service(server.context);
   return true;
-}, CaptureSettings{server.config.fps, server.config.bitrate_min, server.config.bitrate_start, server.config.bitrate_max},
+}, CaptureSettings{server.config.fps, server.config.bitrate_min, server.config.bitrate_start, server.config.bitrate_max, server.config.encoder},
 backendFor(server.config.backend).capture, [this, &server](uint32_t gen, CursorImage&& cursor) {
   std::lock_guard<std::mutex> lock(mutex);
   if (!generation || gen != generation) return;
@@ -346,7 +346,7 @@ void Server::forgetInput(lws* wsi) {
 int Server::Stream::write(bool proxy) {
   auto* wsi = viewer;
   updateFlow(proxy);
-  std::optional<EncodedFrame> frame;
+  std::shared_ptr<const EncodedFrame> frame;
   std::optional<CursorImage> cursor;
   std::vector<uint8_t> wire;
   if (lastSequence && clipboard_pending) {
@@ -359,12 +359,11 @@ int Server::Stream::write(bool proxy) {
   }
   { std::lock_guard<std::mutex> lock(mutex);
     if (failed) return -1;
-    // Start with video to establish the generation; then share writes fairly.
     if (lastSequence && pending_cursor && (!last_write_cursor || pending.empty())) {
       cursor = std::move(pending_cursor); pending_cursor.reset();
     } else {
       if (pending.empty()) return 0;
-      frame.emplace(std::move(pending.front())); pending.pop_front();
+      frame = std::move(pending.front()); pending.pop_front();
     }
   }
   if (cursor) {
@@ -379,7 +378,7 @@ int Server::Stream::write(bool proxy) {
     }
     return 0;
   }
-  auto& f = *frame;
+  const auto& f = *frame;
   if (f.generation != generation) return 0;
   if (!frameMessage(wire, LWS_PRE, generation, lastSequence, f, width, height)) return -1;
   const size_t size = wire.size() - LWS_PRE;
@@ -585,13 +584,18 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
           lws_set_timer_usecs(wsi, 5000000); return 0;
         }
         const std::string backend = s->input->name();
+        const auto stats = s->streams[0]->capture.stats();
         const std::string json = "{\"version\":1,\"backend\":\"" + backend +
             "\",\"width\":" + std::to_string(s->width) + ",\"height\":" + std::to_string(s->height) +
             ",\"fps\":" + std::to_string(s->config.fps) +
             ",\"input\":{\"keyboard\":true,\"pointer\":true,\"buttons\":true,\"wheel\":true}," +
             "\"screenshot\":\"/screenshot.png\",\"control\":\"/control\",\"wayland\":" +
             (backend == "wayland" ? "true" : "false") +
-            ",\"max_input_pending\":32,\"cursor\":" + (s->streams[0]->capture.stats().cursor_supported ? "true" : "false") +
+            ",\"max_input_pending\":32,\"cursor\":" + (stats.cursor_supported ? "true" : "false") +
+            ",\"encoder\":" + jsonString(stats.encoder) +
+            ",\"hardware_encoder\":" + (stats.hardware_encoder ? "true" : "false") +
+            ",\"encoder_state\":" + jsonString(stats.encoder_state) +
+            ",\"transfer_tier\":" + jsonString(transferTierName(stats.transfer_tier)) +
             ",\"input_endpoint\":\"/input\",\"max_input_batch\":" + std::to_string(max_input_batch) +
             ",\"audio\":false,\"clipboard\":" + (s->clipboard.available() ? "true" : "false") +
             ",\"clipboard_endpoint\":\"/clipboard\",\"max_clipboard_bytes\":" + std::to_string(max_clipboard_bytes) +
