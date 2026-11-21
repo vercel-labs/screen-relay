@@ -41,6 +41,16 @@ constexpr uint16_t close_busy = 4003;
 /** Plans a connection without changing the current input owner or any active stream. */
 ConnectionPlan connectionPlan(Socket socket, size_t viewerCount, bool streamOwnsInput, bool controlOpen,
                               size_t grantViewerCount, bool grant, bool inputViewerHasGrant);
+/** True when a caller may replace or tear down an active WebRTC session owned by sessionGrantId (0 = session token owner). */
+bool rtcSessionAuthorized(bool callerIsOwner, uint64_t callerGrantId, uint64_t sessionGrantId);
+/** Result of checking whether a WebRTC offer fits total and delegated viewer limits. */
+struct RtcAdmission {
+  bool allowed = false;
+  bool replace = false;
+};
+/** Checks total and delegated viewer limits and whether an owner must replace a viewer. */
+RtcAdmission rtcAdmission(size_t wsViewerCount, size_t wsGrantViewerCount,
+                          size_t rtcViewerCount, size_t rtcGrantViewerCount, uint64_t callerGrantId, bool hasReplaceableGrantRtc);
 /**
  * The builders below fill out with pre zero bytes of caller padding followed by one NSL1 message.
  * frameMessage and cursorMessage return false when the payload must not be sent.

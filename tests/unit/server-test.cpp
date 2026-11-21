@@ -2,10 +2,13 @@
 #include "server/clipboard.hpp"
 #include "server/config.hpp"
 #include "server/metrics.hpp"
+#include "server/rtc.hpp"
 #include "server/wire.hpp"
 #include <libwebsockets.h>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <condition_variable>
 #include <mutex>
@@ -16,6 +19,36 @@
 #include <vector>
 #ifndef _WIN32
 #include <sys/stat.h>
+#else
+#include <windows.h>
+#include <aclapi.h>
+#endif
+
+#ifdef _WIN32
+static bool setPrivateWindowsAcl(const std::string& path) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+  alignas(TOKEN_USER) unsigned char buffer[256];
+  DWORD length = 0;
+  const bool queried = GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &length);
+  CloseHandle(token);
+  if (!queried) return false;
+  EXPLICIT_ACCESS_A ea{};
+  ea.grfAccessPermissions = FILE_ALL_ACCESS;
+  ea.grfAccessMode = SET_ACCESS;
+  ea.grfInheritance = NO_INHERITANCE;
+  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  ea.Trustee.ptstrName = static_cast<LPSTR>(reinterpret_cast<TOKEN_USER*>(buffer)->User.Sid);
+  PACL dacl = nullptr;
+  if (SetEntriesInAclA(1, &ea, nullptr, &dacl) != ERROR_SUCCESS) return false;
+  std::string mutable_path = path;
+  const DWORD rc = SetNamedSecurityInfoA(mutable_path.data(), SE_FILE_OBJECT,
+                                         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, dacl, nullptr);
+  LocalFree(dacl);
+  return rc == ERROR_SUCCESS;
+}
 #endif
 
 static bool engineConfig(const std::vector<std::string>& options, relay::Config& config, std::string* error = nullptr) {
@@ -228,8 +261,8 @@ int main() {
   assert(!clipboardLength("0", length) && length == 0);
   assert(!clipboardLength("262144", length) && clipboardLength("262145", length) == HTTP_STATUS_REQ_ENTITY_TOO_LARGE);
   assert(validText("") && validText("caf\xc3\xa9 \xe2\x9c\x93 \xf0\x9f\x9a\x80\n"));
-  for (const std::string bad : {std::string("a\0b", 3), std::string("\xff"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"),
-                                std::string("\xf4\x90\x80\x80"), std::string("\xe2\x9c")}) {
+  for (const std::string& bad : {std::string("a\0b", 3), std::string("\xff"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"),
+                                 std::string("\xf4\x90\x80\x80"), std::string("\xe2\x9c")}) {
     assert(!validText(bad));
   }
   assert(jsonString("a\"b\\c\n\t\r\x01\xe2\x9c\x93") == "\"a\\\"b\\\\c\\n\\t\\r\\u0001\xe2\x9c\x93\"");
@@ -275,7 +308,8 @@ int main() {
   Config engine;
   const std::string defaultName = defaultBackend().name;
   assert(engineConfig({}, engine) && engine.backend == defaultName && engine.fps == 60 &&
-         engine.bitrate_min == 1000000 && engine.bitrate_start == 8000000 && engine.bitrate_max == 40000000);
+         engine.bitrate_min == 1000000 && engine.bitrate_start == 8000000 && engine.bitrate_max == 40000000 &&
+         engine.encoder == "auto");
   assert(engineConfig({"--backend", defaultName, "--output", "HDMI-A-1"}, engine) &&
          engine.backend == defaultName && engine.output == "HDMI-A-1");
   assert(engineConfig({"--check", "--viewer-dir", "build/missing-viewer"}, engine) && engine.check);
@@ -300,7 +334,118 @@ int main() {
   assert(engineConfig({"--encoder", "x264"}, engine) && engine.encoder == "x264");
   assert(engineConfig({"--encoder", "nvenc_1"}, engine) && engine.encoder == "nvenc_1");
   for (const std::string value : {"", "x264-hw", "x264 hw", "x264/hw", "x264#hw"}) {
-    assert(!engineConfig({"--encoder", value}, engine));
+    error.clear();
+    assert(!engineConfig({"--encoder", value}, engine, &error));
   }
+  {
+    IceServer server;
+    assert(parseIceServer("stun:stun.example.com", server) && server.raw == "stun:stun.example.com" && server.url == "stun:stun.example.com" &&
+           server.username.empty() && server.credential.empty());
+    assert(parseIceServer("stun:[2001:db8::1]:3478", server) && server.url == "stun:[2001:db8::1]:3478");
+    assert(parseIceServer("turn:relay.example.com:3478?transport=udp", server) && server.url == "turn:relay.example.com:3478?transport=udp");
+    assert(parseIceServer("turn:user:pass@relay.example.com:3478?transport=tcp", server) &&
+           server.url == "turn:relay.example.com:3478?transport=tcp" && server.username == "user" && server.credential == "pass");
+    assert(parseIceServer("turns:alice:secret@[2001:db8::1]:5349?transport=tcp", server) &&
+           server.url == "turns:[2001:db8::1]:5349?transport=tcp" && server.username == "alice" && server.credential == "secret");
+    for (const std::string spec : {"", "TURN:relay.example.com", "turn:user@relay.example.com", "turn::pass@relay.example.com",
+                                   "turn:user:pass@relay.example.com:0", "turn:user:pass@relay.example.com:65536",
+                                   "turn:user:pass@relay.example.com:080", "stun:user:pass@relay.example.com",
+                                   "turn:relay.example.com?transport=icmp", "turn:relay.example.com?transport=tcp&foo=bar",
+                                   "stun:relay.example.com?transport=udp", "turn:relay.example.com/path",
+                                   "turn:relay.example.com#frag", " turn:relay.example.com ",
+                                   "turn:user:pass@relay.example.com:3478?transport=tcp ",
+                                   "stun:[dead.beef]:3478", "stun:[1..2]:3478"}) {
+      IceServer invalid;
+      assert(!parseIceServer(spec, invalid));
+    }
+  }
+  {
+    Config ice;
+    std::string error;
+    assert(engineConfig({"--ice-server", "stun:stun.example.com", "--ice-server", "turn:user:pass@relay.example.com:3478?transport=tcp"}, ice, &error));
+    assert(ice.ice_servers.size() == 2);
+    assert(ice.ice_servers[0].url == "stun:stun.example.com");
+    assert(ice.ice_servers[1].url == "turn:relay.example.com:3478?transport=tcp");
+    assert(ice.ice_servers[1].username == "user" && ice.ice_servers[1].credential == "pass");
+    std::vector<std::string> many_ice_servers;
+    for (int index = 0; index < 8; ++index) {
+      many_ice_servers.push_back("--ice-server");
+      many_ice_servers.push_back("stun:stun" + std::to_string(index) + ".example.com");
+    }
+    assert(engineConfig(many_ice_servers, ice, &error) && ice.ice_servers.size() == 8);
+    many_ice_servers.push_back("--ice-server");
+    many_ice_servers.push_back("stun:overflow.example.com");
+    error.clear();
+    assert(!engineConfig(many_ice_servers, ice, &error));
+  }
+  {
+    const auto ice_file = std::filesystem::path("build/test-ice-servers.txt");
+    {
+      std::ofstream out(ice_file);
+      out << "# comment\n\nstun:stun.example.com\nturn:alice:secret@turn.example.com:3478?transport=tcp\n";
+    }
+#ifdef _WIN32
+    assert(setPrivateWindowsAcl(ice_file.string()));
+#else
+    chmod(ice_file.c_str(), 0644);
+    Config bad_mode;
+    std::string mode_error;
+    assert(!engineConfig({"--ice-servers-file", ice_file.string()}, bad_mode, &mode_error));
+    chmod(ice_file.c_str(), 0600);
+#endif
+    Config from_file;
+    assert(engineConfig({"--ice-servers-file", ice_file.string()}, from_file));
+    assert(from_file.ice_servers.size() == 2);
+    assert(from_file.ice_servers[0].url == "stun:stun.example.com");
+    assert(from_file.ice_servers[1].url == "turn:turn.example.com:3478?transport=tcp");
+    assert(from_file.ice_servers[1].username == "alice" && from_file.ice_servers[1].credential == "secret");
+    std::filesystem::remove(ice_file);
+  }
+  {
+    assert(rtcSessionAuthorized(true, 0, 0));
+    assert(rtcSessionAuthorized(true, 0, 7));
+    assert(rtcSessionAuthorized(false, 7, 7));
+    assert(!rtcSessionAuthorized(false, 7, 0));
+    assert(!rtcSessionAuthorized(false, 7, 8));
+    assert(!rtcSessionAuthorized(false, 0, 0));
+
+    assert(rtcAdmission(0, 0, 0, 0, 7, false).allowed);
+    assert(rtcAdmission(2, 1, 1, 1, 7, false).allowed);
+    assert(!rtcAdmission(2, 2, 1, 1, 7, false).allowed);
+    assert(!rtcAdmission(2, 1, 2, 1, 7, false).allowed);
+    assert(rtcAdmission(2, 2, 1, 1, 0, false).allowed);
+    const auto takeover = rtcAdmission(2, 1, 2, 1, 0, false);
+    assert(takeover.allowed && takeover.replace);
+    const auto grant_replacement = rtcAdmission(2, 2, 1, 1, 7, true);
+    assert(grant_replacement.allowed && grant_replacement.replace);
+    assert(!rtcAdmission(3, 1, 2, 1, 0, false).allowed);
+    assert(!connectionPlan(Socket::take, 1, true, false, 0, true, false).open);
+
+  }
+#ifndef RELAY_RTC
+  {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool woke = false;
+    RtcCallbacks callbacks;
+    callbacks.wake = [&] {
+      std::lock_guard<std::mutex> lock(mutex);
+      woke = true;
+      ready.notify_one();
+    };
+    RtcSession session({}, true, false, std::move(callbacks));
+    assert(session.state() == RtcState::idle && !session.closed());
+    session.startOffer("offer");
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(2), [&] { return woke; }));
+    }
+    std::string answer, error;
+    assert(session.takeAnswer(answer, error) && answer.empty() && error == "rtc_disabled");
+    assert(session.closed() && !session.canSendInput() && !session.canReceiveClipboard());
+    assert(session.takeInput().empty() && session.takeAcks().empty());
+    session.close();
+  }
+#endif
   return 0;
 }

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { createContext, runInContext } from 'node:vm';
 
-function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = false, fetch = async () => ({ ok: false, status: 401 }), navigator, hash = '' } = {}) {
+function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = false, fetch = async () => ({ ok: false, status: 401 }), navigator, hash = '', rtc } = {}) {
   const listeners = {}, windowListeners = {}, elements = {}, sockets = [], trace = [], animationFrames = new Map(), timers = [];
   const decodeQueue = [];
   let now = 0, nextAnimationFrame = 1;
@@ -14,7 +14,7 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
       value: '', attributes: {}, handlers: {}, text: '', textWrites: 0,
       get textContent() { return this.text; },
       set textContent(value) { this.text = value; this.textWrites++; },
-      getContext: () => ({ drawImage(frame) { trace.push(['draw', frame.timestamp]); } }),
+      getContext: () => ({ drawImage(frame) { trace.push(['draw', frame.timestamp]); }, putImageData() {} }),
       addEventListener(name, callback) { this.handlers[name] = callback; },
       setAttribute(name, value) { this.attributes[name] = String(value); }, focus() {},
       querySelector: (selector) => children[selector] ||= element(),
@@ -57,16 +57,17 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
   };
   const context = createContext({
     document, window: { devicePixelRatio, VideoDecoder: Decoder, EncodedVideoChunk: true, addEventListener: (name, callback) => { windowListeners[name] = callback; } },
-    location: { protocol: 'http:', hostname: 'localhost', host: 'localhost', hash, pathname: '/', search: '' },
+    location: { protocol: 'http:', hostname: 'localhost', host: 'localhost', href: 'http://localhost/', hash, pathname: '/', search: '' },
     history: { replaceState() {} },
     URL, URLSearchParams, AbortSignal, WebSocket: Socket, VideoDecoder: Decoder,
     EncodedVideoChunk: class { constructor(options) { Object.assign(this, options); } },
+    ImageData: class { constructor(pixels, width, height) { this.pixels = pixels; this.width = width; this.height = height; } },
     MutationObserver: class { observe() {} }, ResizeObserver: class { observe() {} },
     performance: { now: () => now }, setInterval: () => 1, clearInterval() {},
     setTimeout: (callback) => timers.push(callback), clearTimeout() {}, navigator,
     requestAnimationFrame(callback) { const id = nextAnimationFrame++; animationFrames.set(id, callback); return id; },
     cancelAnimationFrame(id) { animationFrames.delete(id); },
-    fetch, localStorage: storage,
+    fetch, localStorage: storage, ...rtc?.globals,
   });
   runInContext(readFileSync('dist/viewer/viewer.js', 'utf8'), context);
   const frame = (seq, width = 1280, height = 720, payloadLength = 8, stamp = seq) => runInContext(`(() => {
@@ -1051,3 +1052,173 @@ test('an ended grant stays disconnected until a new credential is supplied', () 
   assert.equal(app.sockets.at(-1).url, 'ws://localhost/stream?clipboard=1');
   assert.equal(action('control').hidden, false);
 });
+
+test('a WebRTC link falls back to the WebSocket stream when the engine does not offer WebRTC', async () => {
+  const app = viewer({ hash: '#transport=rtc' });
+  await settle();
+  assert.equal(app.sockets.length, 1);
+  assert.equal(app.sockets[0].url, 'ws://localhost/stream?clipboard=1');
+  const stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportMode, 'rtc');
+  assert.equal(stats.transportState, 'rtc-fallback-ws');
+  assert.equal(stats.transport.reason, 'the engine does not offer WebRTC');
+});
+
+test('a WebRTC-only link reports the failure and opens no WebSocket', async () => {
+  const app = viewer({ hash: '#transport=rtc-only' });
+  await settle();
+  assert.equal(app.sockets.length, 0);
+  assert.equal(app.document.querySelector('#status').textContent, 'WebRTC failed: the engine does not offer WebRTC');
+  const stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportMode, 'rtc-only');
+  assert.equal(stats.transportState, 'rtc-failed');
+  assert.equal(stats.transport.reason, 'the engine does not offer WebRTC');
+});
+
+function fakeRtc() {
+  const peers = [];
+  class Channel {
+    constructor(label) { this.label = label; this.readyState = 'open'; this.binaryType = ''; this.sent = []; this.onmessage = null; }
+    send(data) { this.sent.push(data); }
+    close() { this.readyState = 'closed'; }
+  }
+  class Peer {
+    constructor() { this.connectionState = 'new'; this.iceGatheringState = 'complete'; this.channels = []; peers.push(this); }
+    addTransceiver() { return { receiver: {}, setCodecPreferences() {} }; }
+    createDataChannel(label) { const channel = new Channel(label); this.channels.push(channel); return channel; }
+    async createOffer() { return { type: 'offer', sdp: 'offer-sdp' }; }
+    async setLocalDescription(description) { this.localDescription = description; }
+    async setRemoteDescription(description) { this.remoteDescription = description; }
+    addEventListener() {}
+    async getStats() { return new Map(); }
+    close() { this.closed = true; }
+    connect() { this.connectionState = 'connected'; this.onconnectionstatechange?.(); }
+  }
+  return {
+    peers,
+    globals: {
+      RTCPeerConnection: Peer,
+      RTCRtpReceiver: { getCapabilities: () => null },
+      MediaStream: class { constructor(tracks) { this.tracks = tracks; } },
+    },
+  };
+}
+
+function rtcMessage(app, { type, generation, sequence = 0, cursor = false }) {
+  return runInContext(`(() => {
+    const data = new ArrayBuffer(${cursor ? 44 : 20}), view = new DataView(data);
+    view.setUint32(0, 0x4e534c31); view.setUint8(4, 1); view.setUint8(5, ${type});
+    view.setUint32(8, ${generation}); view.setUint32(12, ${sequence}); view.setUint32(16, ${cursor ? 24 : 0});
+    ${cursor ? 'view.setUint16(20, 2); view.setUint16(22, 2); new Uint8Array(data, 28).fill(255);' : ''}
+    return data;
+  })()`, app.context);
+}
+
+const ackTypes = (channel) => channel.sent.filter((bytes) => bytes[5] === 2);
+
+test('the default transport opens the WebSocket at once and stays live when the engine has no WebRTC', async () => {
+  const requests = [];
+  const app = viewer({
+    fetch: async (path) => {
+      requests.push(path);
+      return path === '/capabilities' ? { ok: true, json: async () => ({ fps: 60, clipboard: true, rtc: false, encoder: 'h264' }) } : { ok: false, status: 404 };
+    },
+  });
+  assert.equal(app.sockets.length, 1);
+  assert.equal(app.sockets[0].url, 'ws://localhost/stream?clipboard=1');
+  await settle();
+  app.sockets[0].onopen();
+  app.frame(1);
+  app.tick(0);
+  const stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportMode, 'auto');
+  assert.equal(stats.transportState, 'ws-live');
+  assert.equal(stats.transport.rtcProbe, 'idle');
+  assert.equal(stats.probe, null);
+  assert.deepEqual(requests, ['/capabilities']);
+  assert.equal(app.context.window.nativeStats.decodeerrors, 0);
+  assert.equal(app.document.querySelector('#status').textContent, 'Live · you have control');
+  assert.equal(app.sockets[0].readyState, 1);
+});
+
+test('an explicit WebSocket transport never probes WebRTC, even when the engine offers it', async () => {
+  const requests = [];
+  const app = viewer({
+    hash: '#transport=ws',
+    rtc: fakeRtc(),
+    fetch: async (path) => {
+      requests.push(path);
+      return path === '/capabilities' ? { ok: true, json: async () => ({ fps: 60, rtc: true }) } : { ok: false, status: 404 };
+    },
+  });
+  app.sockets[0].onopen();
+  await settle();
+  const stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportMode, 'ws');
+  assert.equal(stats.transportState, 'ws-live');
+  assert.equal(stats.transport.rtcProbe, 'unavailable');
+  assert.deepEqual(requests, ['/capabilities']);
+});
+
+test('the background probe keeps the WebSocket stream live and hands over only once its video plays', async () => {
+  const rtc = fakeRtc();
+  const requests = [];
+  const app = viewer({
+    rtc,
+    fetch: async (path, options = {}) => {
+      requests.push([path, options.method ?? 'GET']);
+      if (path === '/capabilities') return { ok: true, json: async () => ({ fps: 60, rtc: true, encoder: 'h264', transfer_tier: 2 }) };
+      if (path === '/rtc/config') return { ok: true, json: async () => ({ enabled: true }) };
+      if (path === '/rtc') return { ok: true, headers: { get: () => '/rtc/sessions/7' }, text: async () => 'answer-sdp' };
+      return { ok: false, status: 404 };
+    },
+  });
+  const video = app.document.querySelector('#video');
+  video.hidden = true;
+  app.sockets[0].onopen();
+  app.frame(1);
+  await settle();
+  await settle();
+  assert.equal(rtc.peers.length, 1);
+  const peer = rtc.peers[0], events = peer.channels[1];
+  assert.deepEqual(requests, [['/capabilities', 'GET'], ['/rtc/config', 'GET'], ['/rtc', 'POST']]);
+  let stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportState, 'ws-live');
+  assert.equal(stats.transport.rtcProbe, 'probing');
+  assert.equal(app.sockets[0].readyState, 1);
+  const probeMark = app.timerCount();
+  events.onmessage({ data: rtcMessage(app, { type: 1, generation: 5, sequence: 1 }) });
+  events.onmessage({ data: rtcMessage(app, { type: 6, generation: 5, cursor: true }) });
+  app.timersAfter(probeMark);
+  assert.equal(ackTypes(events).length, 1);
+  assert.equal(app.document.querySelector('#cursor').hidden, true);
+  peer.connect();
+  stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportState, 'ws-live');
+  assert.equal(app.sockets[0].readyState, 1);
+  assert.equal(app.document.querySelector('#screen').hidden, false);
+  video.videoWidth = 1280;
+  video.videoHeight = 720;
+  video.handlers.playing();
+  assert.equal(app.sockets[0].readyState, 2);
+  assert.equal(app.sockets[0].events.at(-1), 'close');
+  assert.equal(app.document.querySelector('#screen').hidden, true);
+  assert.equal(video.hidden, false);
+  stats = await app.context.window.__relayRtcStats();
+  assert.equal(stats.transportMode, 'auto');
+  assert.equal(stats.transportState, 'rtc-live');
+  assert.equal(stats.transport.fallback, true);
+  assert.equal(app.document.querySelector('#cursor').hidden, true);
+  app.document.querySelector('#video').handlers.pointermove({ clientX: 100, clientY: 100, pointerType: 'mouse' });
+  assert.equal(app.document.querySelector('#cursor').hidden, false);
+  const mark = app.timerCount();
+  events.onmessage({ data: rtcMessage(app, { type: 1, generation: 5, sequence: 2 }) });
+  app.timersAfter(mark);
+  const acks = ackTypes(events);
+  assert.equal(acks.length, 2);
+  const ack = new DataView(acks.at(-1).buffer, acks.at(-1).byteOffset, acks.at(-1).byteLength);
+  assert.equal(ack.getUint32(8), 5);
+  assert.equal(ack.getUint32(12), 2);
+  assert.equal(ack.byteLength, 24);
+});
+

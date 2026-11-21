@@ -41,6 +41,13 @@ CXXFLAGS ?= -O2
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -pthread
 BACKEND_LIBS = $(foreach backend,$(BACKENDS),$(BACKEND_LIBS_$(backend)))
 LDLIBS += $(shell pkg-config --libs $(PKGS)) $(BACKEND_LIBS) -pthread
+ifeq ($(RTC),1)
+RTC_PKGS := $(shell pkg-config --exists libdatachannel && echo libdatachannel)
+RTC_CPPFLAGS = -DRELAY_RTC $(if $(RTC_PKGS),$(shell pkg-config --cflags $(RTC_PKGS)),$(if $(wildcard /opt/homebrew/include/rtc),-I/opt/homebrew/include))
+RTC_LDLIBS = $(if $(RTC_PKGS),$(shell pkg-config --libs $(RTC_PKGS)),$(if $(wildcard /opt/homebrew/lib/libdatachannel.*),-L/opt/homebrew/lib) -ldatachannel)
+endif
+CPPFLAGS += $(RTC_CPPFLAGS)
+LDLIBS += $(RTC_LDLIBS)
 
 CORE_SRCS = $(wildcard src/engine/core/*.cpp)
 ENCODER_PLATFORM_SRCS = $(if $(HAS_MACOS),src/engine/backends/macos/vt_encoder.mm)
@@ -154,16 +161,20 @@ build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENC
 test-backend: build/backend-source-test
 	./build/backend-source-test
 
-SERVER_TEST_SRCS = src/engine/server/clipboard.cpp src/engine/server/config.cpp src/engine/server/metrics.cpp src/engine/server/wire.cpp src/engine/server/backend.cpp src/engine/core/input.cpp src/engine/core/wait.cpp $(filter-out src/engine/backends/macos/vt_encoder.mm,$(BACKEND_SRCS))
+SERVER_TEST_SRCS = src/engine/server/clipboard.cpp src/engine/server/config.cpp src/engine/server/metrics.cpp src/engine/server/rtc.cpp src/engine/server/wire.cpp src/engine/server/backend.cpp src/engine/core/input.cpp src/engine/core/wait.cpp $(filter-out src/engine/backends/macos/vt_encoder.mm,$(BACKEND_SRCS))
 
 build/test-viewer/viewer.js:
 	mkdir -p build/test-viewer
 	: > build/test-viewer/index.html
 	: > build/test-viewer/viewer.js
 
-build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends
+build/server-test-rtc: FORCE
 	mkdir -p build
-	$(CXX) -Isrc/engine $(BACKEND_CPPFLAGS) $(if $(HAS_WAYLAND),-Ibuild/protocols) $(shell pkg-config --cflags $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(shell pkg-config --libs $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(BACKEND_LIBS)
+	@printf '%s\n' '$(RTC)' | cmp -s - $@ || printf '%s\n' '$(RTC)' > $@
+
+build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends build/server-test-rtc
+	mkdir -p build
+	$(CXX) -Isrc/engine $(BACKEND_CPPFLAGS) $(if $(HAS_WAYLAND),-Ibuild/protocols) $(RTC_CPPFLAGS) $(shell pkg-config --cflags $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(shell pkg-config --libs $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(BACKEND_LIBS) $(RTC_LDLIBS)
 
 test-server: build/server-test
 	./build/server-test

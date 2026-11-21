@@ -40,9 +40,9 @@ bool deniesOrAudits(BYTE type) {
   }
 }
 /// Reports whether only the current user, SYSTEM, and Administrators own or may open the file.
-bool privateTokenFile(const std::string& path) {
+bool privateFile(const std::string& path, uintmax_t max_bytes) {
   std::error_code error;
-  if (!std::filesystem::is_regular_file(path, error) || std::filesystem::file_size(path, error) > 66 || error) return false;
+  if (!std::filesystem::is_regular_file(path, error) || std::filesystem::file_size(path, error) > max_bytes || error) return false;
   HANDLE token = nullptr;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
   alignas(TOKEN_USER) unsigned char buffer[256];
@@ -124,12 +124,14 @@ bool privateTokenAcl(const std::string&) { return true; }
 #endif
 #ifndef _WIN32
 /// Reports whether the current user owns the file and no other user can read or write it.
-bool privateTokenFile(const std::string& path) {
+bool privateFile(const std::string& path, uintmax_t max_bytes) {
   struct stat st{};
   return !stat(path.c_str(), &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & 0077) &&
-         st.st_size <= 66 && privateTokenAcl(path);
+         uintmax_t(st.st_size) <= max_bytes && privateTokenAcl(path);
 }
 #endif
+bool privateTokenFile(const std::string& path) { return privateFile(path, 66); }
+bool privateIceServersFile(const std::string& path) { return privateFile(path, 16384); }
 }
 bool secretEqual(const std::string& a, const std::string& b) {
   if (a.size() != b.size()) return false;
@@ -278,9 +280,123 @@ bool allowedOrigin(const Config& config, lws* wsi) {
 bool localRequest(const Config& config, lws* wsi) { return localHost(config, wsi) && allowedOrigin(config, wsi); }
 bool unsignedNumber(const std::string& text, uint64_t& value) {
   if (text.empty()) return false;
-  const auto parsed = std::from_chars(text.data(), text.data()+text.size(), value);
-  return parsed.ec == std::errc{} && parsed.ptr == text.data()+text.size();
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
 }
+
+namespace {
+bool iceServerControl(unsigned char c) {
+  return c <= 0x20 || c == 0x7f;
+}
+
+bool iceServerHostname(const std::string& host) {
+  if (host.empty() || host.front() == '.' || host.back() == '.' || host.front() == '-' || host.back() == '-') return false;
+  size_t start = 0;
+  while (start < host.size()) {
+    const auto dot = host.find('.', start);
+    const auto end = dot == std::string::npos ? host.size() : dot;
+    if (end == start) return false;
+    if (host[start] == '-' || host[end - 1] == '-') return false;
+    for (size_t index = start; index < end; ++index) {
+      const unsigned char c = static_cast<unsigned char>(host[index]);
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    if (dot == std::string::npos) break;
+    start = dot + 1;
+  }
+  return true;
+}
+
+bool iceServerIpv6(const std::string& host) {
+  if (host.empty() || host.find(':') == std::string::npos) return false;
+  if (host.front() == '.' || host.back() == '.' || host.find("..") != std::string::npos) return false;
+  for (unsigned char c : host) {
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':' || c == '.') continue;
+    return false;
+  }
+  return true;
+}
+
+bool iceServerPort(const std::string& text, uint64_t& port) {
+  return text.size() <= 5 && !text.empty() && text.front() != '0' && unsignedNumber(text, port) && port > 0 && port <= 65535;
+}
+
+bool encoderName(const std::string& value) {
+  return !value.empty() && value.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos;
+}
+}
+
+bool parseIceServer(const std::string& spec, IceServer& out) {
+  if (spec.empty()) return false;
+  for (unsigned char c : spec) if (iceServerControl(c)) return false;
+  if (spec.find('#') != std::string::npos || spec.find('/') != std::string::npos) return false;
+  const bool stun = spec.rfind("stun:", 0) == 0;
+  const bool turn = spec.rfind("turn:", 0) == 0;
+  const bool turns = spec.rfind("turns:", 0) == 0;
+  if (!stun && !turn && !turns) return false;
+  const std::string scheme = stun ? "stun:" : turn ? "turn:" : "turns:";
+  std::string authority = spec.substr(scheme.size());
+  if (authority.empty()) return false;
+  IceServer parsed;
+  parsed.raw = spec;
+  if (!stun) {
+    const auto at = authority.find('@');
+    if (at != std::string::npos) {
+      const std::string userinfo = authority.substr(0, at);
+      const auto colon = userinfo.find(':');
+      if (userinfo.empty() || colon == std::string::npos || colon == 0 || colon + 1 == userinfo.size() ||
+          userinfo.find(':', colon + 1) != std::string::npos || userinfo.find_first_of("@?") != std::string::npos) return false;
+      parsed.username = userinfo.substr(0, colon);
+      parsed.credential = userinfo.substr(colon + 1);
+      authority.erase(0, at + 1);
+      if (authority.empty()) return false;
+    }
+  } else if (authority.find('@') != std::string::npos) {
+    return false;
+  }
+  std::string query_suffix;
+  const auto query = authority.find('?');
+  if (query != std::string::npos) {
+    if (stun) return false;
+    query_suffix = authority.substr(query);
+    if (query_suffix != "?transport=udp" && query_suffix != "?transport=tcp") return false;
+    authority.erase(query);
+  }
+  if (authority.empty()) return false;
+  std::string host;
+  std::string port_text;
+  if (authority.front() == '[') {
+    const auto close = authority.find(']');
+    if (close == std::string::npos || close == 1) return false;
+    host = authority.substr(1, close - 1);
+    if (!iceServerIpv6(host)) return false;
+    if (close + 1 < authority.size()) {
+      if (authority[close + 1] != ':') return false;
+      port_text = authority.substr(close + 2);
+      if (port_text.empty()) return false;
+    }
+  } else {
+    const auto colon = authority.find(':');
+    if (colon != std::string::npos) {
+      if (authority.find(':', colon + 1) != std::string::npos) return false;
+      host = authority.substr(0, colon);
+      port_text = authority.substr(colon + 1);
+      if (port_text.empty()) return false;
+    } else {
+      host = authority;
+    }
+    if (!iceServerHostname(host)) return false;
+  }
+  if (host.empty()) return false;
+  if (!port_text.empty()) {
+    uint64_t port = 0;
+    if (!iceServerPort(port_text, port)) return false;
+  }
+  parsed.url = scheme + authority + query_suffix;
+  out = std::move(parsed);
+  return true;
+}
+
 bool parseConfig(int argc, char** argv, Config& config) {
   config.viewer = (executablePath().parent_path() / "viewer").string();
   if (config.backend.empty()) config.backend = defaultBackend().name;
@@ -295,6 +411,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (option == "--help") {
       std::cout << "Usage: relay-engine [--bind ADDRESS] [--port PORT] [--viewer-dir DIR]\n"
                    "  [--backend NAME] [--output NAME] [--encoder auto|x264|NAME] [--check]\n"
+                   "  [--ice-server URL]... [--ice-servers-file FILE]\n"
                    "  [--fps N] [--bitrate-min BPS] [--bitrate-start BPS] [--bitrate-max BPS]\n"
                    "  [--token-file FILE [--public-origin https://HOST[:PORT]]\n"
                    "    [--allow-origin ORIGIN[,...]]]\n"
@@ -310,7 +427,7 @@ bool parseConfig(int argc, char** argv, Config& config) {
                    "--check initializes the backend and exits without starting capture or the server.\n"
                    "Attach to DISPLAY using the caller's XAUTHORITY. Defaults: 127.0.0.1:8080, 60 fps,\n"
                    "encoder auto, 1000000/8000000/40000000 bps.\n"
-                << "Compiled backends: " << backendNames() << '\n';
+                   << "Compiled backends: " << backendNames() << '\n';
       return false;
     }
     if (option == "--behind-tls-proxy") { config.proxy = true; continue; }
@@ -322,9 +439,30 @@ bool parseConfig(int argc, char** argv, Config& config) {
     else if (option == "--backend") config.backend = value;
     else if (option == "--output") config.output = value;
     else if (option == "--encoder") {
-      if (value.empty() || value.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
-        throw std::runtime_error("Encoder must be auto, x264, or an alphanumeric/underscore name");
+      if (!encoderName(value)) throw std::runtime_error("Encoder must be auto, x264, or an alphanumeric/underscore name");
       config.encoder = value;
+    } else if (option == "--ice-server") {
+      if (config.ice_servers.size() == 8) throw std::runtime_error("At most 8 ICE servers");
+      IceServer server;
+      if (!parseIceServer(value, server)) throw std::runtime_error("Invalid ICE server");
+      config.ice_servers.push_back(std::move(server));
+    } else if (option == "--ice-servers-file") {
+      if (!privateIceServersFile(value))
+        throw std::runtime_error("ICE servers file must be private, owned by this user and at most 16 KiB");
+      std::ifstream file(value);
+      if (!file) throw std::runtime_error("Could not read ICE servers file");
+      std::string line;
+      while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line[first] == '#') continue;
+        const auto last = line.find_last_not_of(" \t");
+        const std::string entry = line.substr(first, last - first + 1);
+        if (config.ice_servers.size() == 8) throw std::runtime_error("At most 8 ICE servers");
+        IceServer server;
+        if (!parseIceServer(entry, server)) throw std::runtime_error("Invalid ICE server");
+        config.ice_servers.push_back(std::move(server));
+      }
     } else if (option == "--port") {
       uint64_t port;
       if (!unsignedNumber(value, port) || !port || port > 65535) throw std::runtime_error("Invalid port");
@@ -376,4 +514,4 @@ bool parseConfig(int argc, char** argv, Config& config) {
     if (!std::filesystem::is_regular_file(std::filesystem::path(config.viewer)/name)) throw std::runtime_error("Viewer assets missing; use --viewer-dir");
   return true;
 }
-}  // namespace relay
+}

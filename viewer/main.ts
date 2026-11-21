@@ -1,6 +1,6 @@
 import {
-  CLOSE_TAKEN, HID_KEYS, MAX_BYTES_IN_FLIGHT, encodeAck, encodeInput, h264Codec, isLoopback, parseMessage, socketTarget, validToken,
-  type InputEvent, type Message,
+  CLOSE_TAKEN, HEADER_SIZE, HID_KEYS, MAGIC, MAX_BYTES_IN_FLIGHT, MESSAGE_TYPES, VERSION, encodeAck, encodeInput, encodeInputRecord, h264Codec,
+  isLoopback, parseMessage, socketTarget, validToken, type InputEvent, type Message,
 } from '../src/protocol/index.js';
 
 const keys = HID_KEYS;
@@ -8,6 +8,28 @@ const canvas = document.querySelector('#screen') as HTMLCanvasElement,
   ctx = canvas.getContext('2d')!,
   status = document.querySelector('#status')!;
 const cursor = document.querySelector('#cursor') as HTMLCanvasElement, cursorContext = cursor.getContext('2d')!;
+const video = document.querySelector('#video') as HTMLVideoElement;
+/** How the link asked the viewer to connect: WebSocket first with a WebRTC upgrade when offered, the plain WebSocket stream, WebRTC with a fallback, or WebRTC only. */
+type TransportMode = 'auto' | 'ws' | 'rtc' | 'rtc-only';
+/** Progress of the background WebRTC upgrade that runs beside a live WebSocket stream. */
+type RtcProbe = 'idle' | 'probing' | 'unavailable';
+/** Where the connection stands, including the reason WebRTC handed the stream over to WebSocket. */
+type TransportState =
+  | { state: 'ws-connecting' }
+  | { state: 'ws-live'; rtcProbe: RtcProbe }
+  | { state: 'rtc-connecting'; fallback: boolean }
+  | { state: 'rtc-live'; fallback: boolean }
+  | { state: 'rtc-fallback-ws'; reason: string }
+  | { state: 'rtc-failed'; reason: string };
+/** Reads the transport the link asked for; anything missing or unknown means WebSocket first with a WebRTC upgrade. */
+function parseTransport(value: string | null): TransportMode {
+  return value === 'ws' || value === 'rtc' || value === 'rtc-only' ? value : 'auto';
+}
+const transportParam = new URLSearchParams(location.hash.slice(1)).get('transport');
+const transportMode: TransportMode = parseTransport(transportParam);
+/** True when the link is allowed WebRTC and a WebSocket fallback behind it. */
+const rtcFallback = transportMode === 'rtc';
+let transport: TransportState = { state: 'ws-connecting' };
 /** The credential the link carries: the session token, or a watch or control grant that only opens WebSockets. */
 type Access = 'owner' | 'watch' | 'control';
 let accessToken = '', access: Access = 'owner';
@@ -22,20 +44,22 @@ const trustedPage = location.protocol === 'https:' || isLoopback(location.hostna
   }
 }
 let cursorAvailable = false, cursorHotX = 0, cursorHotY = 0, pointerPosition: any;
+/** Projects the remote cursor onto whichever surface shows the stream, so it lands on the same spot over WebRTC and on the canvas. */
 function renderCursor() {
   canvas.style.cursor = cursorAvailable && ready ? 'none' : 'default';
-  const r = canvas.getBoundingClientRect(), p = pointerPosition;
-  cursor.hidden = !cursorAvailable || !ready || !p || p.pointerType === 'touch' ||
-    p.clientX < r.left || p.clientX >= r.right || p.clientY < r.top || p.clientY >= r.bottom;
+  const [r, w, h] = isRtcActive() ? videoRect() : [canvas.getBoundingClientRect(), canvas.width, canvas.height];
+  const p = pointerPosition;
+  cursor.hidden = !cursorAvailable || !ready || !p || p.pointerType === 'touch' || !(w > 0) || !(h > 0) ||
+    p.clientX < r.left || p.clientX >= r.left + r.width || p.clientY < r.top || p.clientY >= r.top + r.height;
   if (cursor.hidden) return;
-  const sx = r.width / canvas.width, sy = r.height / canvas.height;
+  const sx = r.width / w, sy = r.height / h;
   cursor.style.width = `${cursor.width * sx}px`;
   cursor.style.height = `${cursor.height * sy}px`;
   cursor.style.left = `${p.clientX - cursorHotX * sx}px`;
   cursor.style.top = `${p.clientY - cursorHotY * sy}px`;
 }
 function receiveCursor({ generation: gen, width, height, hotX, hotY, pixels }: Extract<Message, { type: 'cursor' }>) {
-  if (!generation || gen !== generation) throw new Error('Invalid cursor envelope');
+  if (!gen || gen !== currentGeneration()) throw new Error('Invalid cursor envelope');
   cursorAvailable = width > 0;
   cursorHotX = hotX; cursorHotY = hotY;
   cursor.width = width || 1; cursor.height = height || 1;
@@ -200,6 +224,11 @@ document.addEventListener('paste', (e) => {
 });
 
 function sendInput(event: InputEvent): boolean {
+  if (isRtcActive()) {
+    if (channel?.readyState !== 'open' || (viewOnly && event.type !== 'releaseAll')) return false;
+    channel.send(encodeInputRecord({ ...event, buttons, modifiers }) as Uint8Array<ArrayBuffer>);
+    return true;
+  }
   if (!ready || socket?.readyState !== WebSocket.OPEN || (viewOnly && event.type !== 'releaseAll')) return false;
   const input = encodeInput({ ...event, buttons, modifiers }, generation, 0);
   if (paste.state === 'idle') socket.send(input);
@@ -400,10 +429,392 @@ function present() {
   }
   if (drew || decoded.length) schedulePresent();
 }
+/** Fields `__relayRtcStats` copies from the inbound-rtp video report. */
+const RTC_STAT_FIELDS = ['framesDecoded', 'framesDropped', 'framesReceived', 'packetsLost', 'nackCount', 'pliCount', 'jitter', 'totalDecodeTime',
+  'frameWidth', 'frameHeight', 'framesPerSecond', 'jitterBufferDelay', 'jitterBufferEmittedCount'];
+/** How long a live WebRTC link may stay disconnected before the viewer gives up on it, in ms. */
+const RTC_GRACE_MS = 4000;
+let pc: RTCPeerConnection | undefined, channel: RTCDataChannel | undefined, eventsChannel: RTCDataChannel | undefined,
+  rtcSession: string | undefined, rtcGraceTimer: any;
+/** What the engine reports about WebRTC: whether it is available, and the STUN and TURN servers it wants used. */
+type RtcConfig = { enabled: boolean; iceServers?: RTCIceServer[] };
+/** How long the background WebRTC upgrade may take before the viewer keeps the WebSocket stream, in ms. */
+const RTC_PROBE_TIMEOUT_MS = 8000;
+/** How often a frame is acknowledged on an events channel that cannot wait for a presented video frame, in ms. */
+const RTC_ACK_INTERVAL_MS = 16;
+/** The latest frame the engine reported on an RTC events channel, waiting for an acknowledgement. */
+type FrameMark = { generation: number; sequence: number; arrived: number };
+/** One WebRTC events channel: the frame marks, cursor images, and clipboard notices the engine pushes beside the media. */
+type RtcEvents = {
+  channel: RTCDataChannel; live: boolean; generation: number; cursor?: Extract<Message, { type: 'cursor' }>;
+  clipboard: boolean; mark?: FrameMark; scheduled: boolean;
+};
+/** A background WebRTC attempt that runs beside the WebSocket stream until its video is ready to take over. */
+type RtcProbeSession = {
+  pc?: RTCPeerConnection; input?: RTCDataChannel; events?: RtcEvents; session?: string; timer: any;
+  connected: boolean; presenting: boolean; attached: boolean; done: boolean;
+};
+let liveEvents: RtcEvents | undefined, probe: RtcProbeSession | undefined;
+/** Set once the page tried the background upgrade, so a flaky engine is not probed again on every reconnect. */
+let probeAttempted = false;
+/** True once the engine's capabilities say it serves WebRTC. */
+let rtcOffered = false;
+/** Set once WebRTC handed the stream to WebSocket, so later reconnects never try WebRTC again. */
+let fellBackToWs = false;
+let fellBackToReason = '';
+/** Why the last background upgrade ended, for the transport snapshot. */
+let probeNote = '';
+
+/** True while the browser draws and sends input over WebRTC rather than the WebSocket stream. */
+function isRtcActive(): boolean {
+  return transport.state === 'rtc-connecting' || transport.state === 'rtc-live';
+}
+/** The stream generation in use, which belongs to the RTC session once WebRTC carries the stream and to the WebSocket stream before that. */
+function currentGeneration(): number {
+  return isRtcActive() && liveEvents ? liveEvents.generation : generation;
+}
+/** Reads the engine's WebRTC settings, or null when it does not serve them. */
+async function rtcConfig(): Promise<RtcConfig | null> {
+  const response = await fetch('/rtc/config', {
+    cache: 'no-store', redirect: 'error', headers: authHeaders(), signal: AbortSignal.timeout(5000),
+  });
+  return response.ok ? await response.json() : null;
+}
+/** Reads the 20-byte frame metadata the engine sends on the events channel, which carries no frame payload. */
+function parseFrameMark(data: ArrayBuffer): { generation: number; sequence: number } | null {
+  if (data.byteLength !== HEADER_SIZE) return null;
+  const view = new DataView(data);
+  const generation = view.getUint32(8), sequence = view.getUint32(12);
+  if (view.getUint32(0) !== MAGIC || view.getUint8(4) !== VERSION || view.getUint8(5) !== MESSAGE_TYPES.frame ||
+      view.getUint32(16) !== 0 || !generation || !sequence) return null;
+  return { generation, sequence };
+}
+/** Sends the pending frame acknowledgement on its events channel, with how long the viewer held the frame. */
+function flushRtcAck(events: RtcEvents) {
+  const mark = events.mark;
+  if (!mark || events.channel.readyState !== 'open') return;
+  try {
+    events.channel.send(encodeAck(mark.generation, mark.sequence, performance.now() - mark.arrived) as Uint8Array<ArrayBuffer>);
+  } catch (error) {}
+}
+/** Schedules one acknowledgement per presented frame, or one every RTC_ACK_INTERVAL_MS while the video cannot report presented frames. */
+function scheduleRtcAck(events: RtcEvents) {
+  if (events.scheduled) return;
+  events.scheduled = true;
+  if (events.live && !video.hidden && typeof (video as any).requestVideoFrameCallback === 'function') {
+    (video as any).requestVideoFrameCallback(() => { events.scheduled = false; flushRtcAck(events); });
+    return;
+  }
+  setTimeout(() => { events.scheduled = false; flushRtcAck(events); }, RTC_ACK_INTERVAL_MS);
+}
+/** Reads one message from an events channel, holding cursor and clipboard notices back until the session carries the stream. */
+function receiveEvents(events: RtcEvents, data: ArrayBuffer) {
+  const mark = parseFrameMark(data);
+  if (mark) {
+    events.generation = mark.generation;
+    events.mark = { ...mark, arrived: performance.now() };
+    scheduleRtcAck(events);
+    return;
+  }
+  let message: Message;
+  try { message = parseMessage(data); } catch (error) { return; }
+  if (message.type === 'cursor') {
+    if (!events.live) { events.cursor = message; return; }
+    try { receiveCursor(message); } catch (error) {}
+    return;
+  }
+  if (message.type !== 'clipboard') return;
+  if (!events.live) { events.clipboard = true; return; }
+  remoteClipboardChanged();
+}
+/** Builds a receive-only video peer connection with the engine's ICE servers and its channels for input and events. */
+function createPeer(config: RtcConfig, live: boolean): { peer: RTCPeerConnection; input: RTCDataChannel; events: RtcEvents } {
+  const peer = new RTCPeerConnection({ iceServers: config.iceServers ?? [] });
+  const transceiver = peer.addTransceiver('video', { direction: 'recvonly' });
+  const codecs = RTCRtpReceiver.getCapabilities?.('video')?.codecs;
+  if (codecs && transceiver.setCodecPreferences) {
+    const rank = (codec: RTCRtpCodec) => codec.mimeType.toLowerCase() !== 'video/h264' || !/packetization-mode=1/.test(codec.sdpFmtpLine ?? '') ? 2
+      : /profile-level-id=42e01f/i.test(codec.sdpFmtpLine ?? '') ? 0 : 1;
+    transceiver.setCodecPreferences([...codecs].sort((a, b) => rank(a) - rank(b)));
+  }
+  const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
+  if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
+  if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
+  const input = peer.createDataChannel('input', { ordered: true });
+  input.binaryType = 'arraybuffer';
+  const events: RtcEvents = { channel: peer.createDataChannel('events', { ordered: true }), live, generation: 0, clipboard: false, scheduled: false };
+  events.channel.binaryType = 'arraybuffer';
+  events.channel.onmessage = (e: MessageEvent) => { if (e.data instanceof ArrayBuffer) receiveEvents(events, e.data); };
+  return { peer, input, events };
+}
+/** Exchanges one non-trickle offer for the engine's answer and returns the URL of the session it created. */
+async function negotiate(peer: RTCPeerConnection): Promise<string> {
+  await peer.setLocalDescription(await peer.createOffer());
+  await new Promise<void>((done) => {
+    if (peer.iceGatheringState === 'complete') { done(); return; }
+    const timer = setTimeout(done, 2000);
+    peer.addEventListener('icegatheringstatechange', () => {
+      if (peer.iceGatheringState !== 'complete') return;
+      clearTimeout(timer);
+      done();
+    });
+  });
+  const answer = await fetch('/rtc', {
+    method: 'POST', cache: 'no-store', redirect: 'error', body: peer.localDescription!.sdp,
+    headers: { 'content-type': 'application/sdp', ...authHeaders() }, signal: AbortSignal.timeout(10000),
+  });
+  if (!answer.ok) throw new Error((await answer.json().catch(() => null))?.error ?? `HTTP ${answer.status}`);
+  const locationHeader = answer.headers.get('location');
+  const session = locationHeader ? new URL(locationHeader, location.href).href : '/rtc/session';
+  await peer.setRemoteDescription({ type: 'answer', sdp: await answer.text() });
+  return session;
+}
+/** Watches the active peer connection, keeping the transport state honest and ending the session when it drops. */
+function bindRtcSession(peer: RTCPeerConnection, fallback: boolean, owner: number) {
+  peer.onconnectionstatechange = () => {
+    if (owner !== epoch || pc !== peer) return;
+    const state = peer.connectionState;
+    if (state === 'connected') {
+      clearTimeout(rtcGraceTimer);
+      transport = { state: 'rtc-live', fallback };
+      return;
+    }
+    if (state === 'failed') { failRtc(`connection ${state}`, fallback); return; }
+    if (state !== 'disconnected') return;
+    if (!ready) { failRtc(`connection ${state}`, fallback); return; }
+    clearTimeout(rtcGraceTimer);
+    rtcGraceTimer = setTimeout(() => {
+      if (owner === epoch && pc === peer && peer.connectionState !== 'connected') failRtc(`connection ${peer.connectionState}`, fallback);
+    }, RTC_GRACE_MS);
+  };
+}
+/** Returns the displayed video content box inside its letterbox, with the stream width and height. */
+function videoRect(): [{ left: number; top: number; width: number; height: number }, number, number] {
+  const box = video.getBoundingClientRect(), w = video.videoWidth, h = video.videoHeight;
+  const scale = w && h ? Math.min(box.width / w, box.height / h) : 0;
+  return [{ left: box.left + (box.width - w * scale) / 2, top: box.top + (box.height - h * scale) / 2, width: w * scale, height: h * scale }, w, h];
+}
+/** Ends the session on the engine so it stops encoding for a peer connection the viewer has dropped. */
+function deleteRtc(session: string) {
+  fetch(session, { method: 'DELETE', cache: 'no-store', redirect: 'error', keepalive: true, headers: authHeaders() }).catch(() => {});
+}
+/** Closes the peer connection, detaches the video element, and ends the session on the engine. */
+function endRtc() {
+  clearTimeout(rtcGraceTimer);
+  const peer = pc;
+  pc = undefined;
+  channel = undefined;
+  eventsChannel = undefined;
+  liveEvents = undefined;
+  peer?.close();
+  if (rtcSession) deleteRtc(rtcSession);
+  rtcSession = undefined;
+  video.srcObject = null;
+}
+/** Continues the stream over WebSocket after WebRTC failed, recording the reason in the transport state. */
+function fallbackToWs(reason: string) {
+  if (fellBackToWs) return;
+  fellBackToWs = true;
+  fellBackToReason = reason;
+  epoch++;
+  endRtc();
+  video.hidden = true;
+  canvas.hidden = false;
+  transport = { state: 'rtc-fallback-ws', reason };
+  reset();
+  connectWs();
+}
+/** Reports a WebRTC failure: hands over to WebSocket when the session allows it, otherwise shows the reason. */
+function failRtc(reason: string, fallback = rtcFallback) {
+  if (fallback) {
+    fallbackToWs(reason);
+    return;
+  }
+  epoch++;
+  endRtc();
+  video.hidden = true;
+  canvas.hidden = false;
+  transport = { state: 'rtc-failed', reason };
+  setStatus(`WebRTC failed: ${reason}`);
+}
+/** Opens the WebRTC path: the engine's ICE servers, a non-trickle offer, and input over the `input` data channel. */
+async function connectRtc() {
+  if (reconnectMode === 'grant-ended') return;
+  clearTimeout(retryTimer);
+  abandonProbe('the viewer connected WebRTC directly');
+  epoch++;
+  const current = epoch;
+  endRtc();
+  reset();
+  canvas.hidden = true;
+  video.hidden = false;
+  transport = { state: 'rtc-connecting', fallback: rtcFallback };
+  setStatus('Connecting… · WebRTC');
+  loadCapabilities();
+  try {
+    const config = await rtcConfig();
+    if (current !== epoch) return;
+    if (!config?.enabled) throw new Error('the engine does not offer WebRTC');
+    const { peer, input, events } = createPeer(config, true);
+    pc = peer;
+    channel = input;
+    eventsChannel = events.channel;
+    liveEvents = events;
+    peer.ontrack = (e) => { if (current === epoch) video.srcObject = e.streams[0] ?? new MediaStream([e.track]); };
+    bindRtcSession(peer, rtcFallback, current);
+    const session = await negotiate(peer);
+    if (current !== epoch) { deleteRtc(session); return; }
+    rtcSession = session;
+  } catch (error: any) {
+    if (current !== epoch) return;
+    failRtc(error.message);
+  }
+}
+/** True when this page could still upgrade its live WebSocket stream to WebRTC. */
+function canProbeRtc(): boolean {
+  return transportMode === 'auto' && !probeAttempted && !fellBackToWs;
+}
+function maybeProbeRtc() {
+  if (!canProbeRtc() || !rtcOffered || probe) return;
+  if (transport.state !== 'ws-live' || transport.rtcProbe !== 'idle') return;
+  probeRtcUpgrade();
+}
+/** Closes a background probe and leaves the live WebSocket stream exactly as it was. */
+function abandonProbe(reason: string) {
+  const attempt = probe;
+  if (!attempt) return;
+  probe = undefined;
+  attempt.done = true;
+  probeNote = reason;
+  clearTimeout(attempt.timer);
+  if (attempt.pc) {
+    attempt.pc.onconnectionstatechange = null;
+    attempt.pc.close();
+  }
+  if (attempt.session) deleteRtc(attempt.session);
+  if (attempt.attached && !pc) video.srcObject = null;
+  if (transport.state === 'ws-live') transport = { state: 'ws-live', rtcProbe: 'unavailable' };
+}
+/** Takes the stream over to WebRTC once the probe is connected and its video is actually playing, leaving the canvas untouched until then. */
+function tryCutOver(attempt: RtcProbeSession) {
+  const events = attempt.events;
+  if (probe !== attempt || attempt.done || !attempt.connected || !attempt.presenting || !attempt.pc || !events || !attempt.session) return;
+  attempt.done = true;
+  probe = undefined;
+  probeNote = '';
+  clearTimeout(attempt.timer);
+  retireDecoded();
+  reset();
+  epoch++;
+  clearTimeout(retryTimer);
+  const ws = socket;
+  socket = undefined as any;
+  if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+  pc = attempt.pc;
+  channel = attempt.input;
+  eventsChannel = events.channel;
+  liveEvents = events;
+  events.live = true;
+  rtcSession = attempt.session;
+  generation = events.generation;
+  ready = true;
+  video.hidden = false;
+  canvas.hidden = true;
+  transport = { state: 'rtc-live', fallback: true };
+  bindRtcSession(attempt.pc, true, epoch);
+  setStatus(`${viewOnly ? 'Live · view only' : 'Live · you have control'} · WebRTC`);
+  if (events.cursor) {
+    try { receiveCursor(events.cursor); } catch (error) { renderCursor(); }
+  } else {
+    renderCursor();
+  }
+  if (events.clipboard) remoteClipboardChanged();
+}
+/** Attempts a WebRTC session beside the live WebSocket stream, taking over only once its video plays. */
+async function probeRtcUpgrade() {
+  if (!canProbeRtc() || probe || !rtcOffered) return;
+  if (transport.state !== 'ws-live' || transport.rtcProbe !== 'idle') return;
+  probeAttempted = true;
+  transport = { state: 'ws-live', rtcProbe: 'probing' };
+  const current = epoch;
+  const attempt: RtcProbeSession = { timer: undefined, connected: false, presenting: false, attached: false, done: false };
+  probe = attempt;
+  attempt.timer = setTimeout(() => { if (probe === attempt) abandonProbe('timed out'); }, RTC_PROBE_TIMEOUT_MS);
+  try {
+    const config = await rtcConfig();
+    if (probe !== attempt) return;
+    if (current !== epoch) { abandonProbe('the stream reconnected'); return; }
+    if (!config?.enabled) { abandonProbe('the engine does not offer WebRTC'); return; }
+    const { peer, input, events } = createPeer(config, false);
+    attempt.pc = peer;
+    attempt.input = input;
+    attempt.events = events;
+    peer.ontrack = (e) => {
+      if (probe !== attempt) return;
+      attempt.attached = true;
+      video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+    };
+    peer.onconnectionstatechange = () => {
+      if (probe !== attempt) return;
+      if (peer.connectionState === 'connected') attempt.connected = true;
+      if (peer.connectionState === 'failed') { abandonProbe(`connection ${peer.connectionState}`); return; }
+      tryCutOver(attempt);
+    };
+    const session = await negotiate(peer);
+    if (probe !== attempt) { deleteRtc(session); return; }
+    attempt.session = session;
+    tryCutOver(attempt);
+  } catch (error: any) {
+    if (probe === attempt) abandonProbe(error.message);
+  }
+}
+video.addEventListener('playing', () => {
+  const attempt = probe;
+  if (attempt) {
+    attempt.presenting = true;
+    tryCutOver(attempt);
+    return;
+  }
+  if (!isRtcActive()) return;
+  ready = true;
+  transport = { state: 'rtc-live', fallback: rtcFallback };
+  setStatus(`${viewOnly ? 'Live · view only' : 'Live · you have control'} · WebRTC`);
+});
+window.addEventListener('pagehide', () => {
+  abandonProbe('the page went away');
+  endRtc();
+});
+/** Snapshot of the peer connection, its video stats, and the selected candidate pair, for seeing which transport carries the stream. */
+async function rtcStatsSnapshot() {
+  const result: Record<string, unknown> = { connectionState: pc?.connectionState ?? 'closed', transportState: transport.state, transportMode, transport, probe: probeNote || null };
+  const reports = await pc?.getStats();
+  reports?.forEach((report: any) => {
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      for (const field of RTC_STAT_FIELDS) result[field] = report[field];
+      result.mimeType = reports.get(report.codecId)?.mimeType;
+    }
+    if (report.type === 'candidate-pair' && (report.selected || (report.nominated && report.state === 'succeeded'))) {
+      result.currentRoundTripTime = report.currentRoundTripTime;
+      result.localCandidateType = reports.get(report.localCandidateId)?.candidateType;
+      result.remoteCandidateType = reports.get(report.remoteCandidateId)?.candidateType;
+    }
+  });
+  return result;
+}
+(window as any).__relayRtcStats = rtcStatsSnapshot;
+/** Connects with the transport the link asked for, opening the WebSocket stream at once in auto mode. */
 function connect() {
+  if ((transportMode === 'rtc' || transportMode === 'rtc-only') && !fellBackToWs) {
+    connectRtc();
+    return;
+  }
+  connectWs();
+}
+function connectWs() {
   if (reconnectMode === 'grant-ended') return;
   reconnectMode = 'automatic';
   clearTimeout(retryTimer);
+  abandonProbe('the WebSocket stream restarted');
   epoch++;
   const current = epoch;
   if (socket && socket.readyState < WebSocket.CLOSING) {
@@ -412,6 +823,7 @@ function connect() {
     socket.close();
   }
   reset();
+  transport = fellBackToWs ? { state: 'rtc-fallback-ws', reason: fellBackToReason } : { state: 'ws-connecting' };
   setStatus('Connecting…');
   if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
     setStatus('WebCodecs unavailable in this browser');
@@ -431,12 +843,15 @@ function connect() {
   let opened = false;
   ws.onopen = () => {
     opened = true;
-    if (current === epoch) {
-      setStatus('Waiting for frame…');
-      deadline = setTimeout(() => {
-        if (current === epoch) fail('First frame timed out; reconnecting');
-      }, 5000);
+    if (current !== epoch) return;
+    if (!fellBackToWs) {
+      transport = { state: 'ws-live', rtcProbe: canProbeRtc() ? 'idle' : 'unavailable' };
+      maybeProbeRtc();
     }
+    setStatus('Waiting for frame…');
+    deadline = setTimeout(() => {
+      if (current === epoch) fail('First frame timed out; reconnecting');
+    }, 5000);
   };
   ws.onmessage = (e: MessageEvent) => {
     if (current !== epoch || ws.readyState !== WebSocket.OPEN) return;
@@ -548,72 +963,14 @@ function connect() {
 function position(e: MouseEvent) {
   pointerPosition = { clientX: e.clientX, clientY: e.clientY, pointerType: (e as PointerEvent).pointerType };
   renderCursor();
-  const r = canvas.getBoundingClientRect();
+  const [r, w, h] = isRtcActive() ? videoRect() : [canvas.getBoundingClientRect(), canvas.width, canvas.height];
   if (r.width <= 0 || r.height <= 0) return;
-  const px = clamp(Math.floor((e.clientX - r.left) * canvas.width / r.width), 0, canvas.width - 1);
-  const py = clamp(Math.floor((e.clientY - r.top) * canvas.height / r.height), 0, canvas.height - 1);
-  x = px / (canvas.width - 1);
-  y = py / (canvas.height - 1);
+  const px = clamp(Math.floor((e.clientX - r.left) * w / r.width), 0, w - 1);
+  const py = clamp(Math.floor((e.clientY - r.top) * h / r.height), 0, h - 1);
+  x = px / (w - 1);
+  y = py / (h - 1);
 }
-canvas.addEventListener('keydown', (e) => {
-  const code = mapKey(keys[e.code]);
-  if (!code) return;
-  if (paste.state !== 'idle' && e.code === 'KeyV') { e.preventDefault(); return; }
-  if (!e.repeat && holdBackPaste(e, code)) return;
-  e.preventDefault();
-  syncCaps(e);
-  if (e.code === 'CapsLock') return;
-  if (e.repeat || held.has(code)) return;
-  if (!holdKey(code)) return;
-  if (clipboardAvailable && !e.altKey && (e.ctrlKey || e.metaKey) && (e.code === 'KeyC' || e.code === 'KeyX')) {
-    expectRemoteCopy();
-  }
-  held.add(code);
-  if (code < 224) releaseLatched();
-});
-canvas.addEventListener('keyup', (e) => {
-  const code = mapKey(keys[e.code]);
-  if (!code) return;
-  e.preventDefault();
-  syncCaps(e);
-  if (e.code === 'CapsLock') return;
-  if (!held.delete(code)) return;
-  if (!dropLatch(code)) releaseKey(code);
-});
-canvas.addEventListener('pointermove', (e) => {
-  position(e);
-  sendInput({ type: 'pointerMove', x, y });
-});
-canvas.addEventListener('pointerleave', () => { pointerPosition = null; renderCursor(); });
-new ResizeObserver(renderCursor).observe(canvas);
-window.addEventListener('scroll', renderCursor, { passive: true });
 const buttonMap: Record<number, 1 | 2 | 3> = { 0: 1, 1: 2, 2: 3 };
-canvas.addEventListener('pointerdown', (e) => {
-  const button = buttonMap[e.button];
-  if (!button) return;
-  e.preventDefault();
-  canvas.focus();
-  position(e);
-  buttons |= 1 << (button - 1);
-  canvas.setPointerCapture(e.pointerId);
-  sendInput({ type: 'buttonDown', button, x, y });
-});
-canvas.addEventListener('pointerup', (e) => {
-  const button = buttonMap[e.button];
-  if (!button) return;
-  e.preventDefault();
-  position(e);
-  buttons &= ~(1 << (button - 1));
-  sendInput({ type: 'buttonUp', button, x, y });
-  if (!buttons && canvas.hasPointerCapture(e.pointerId)) {
-    canvas.releasePointerCapture(e.pointerId);
-  }
-});
-canvas.addEventListener('pointercancel', release);
-canvas.addEventListener('lostpointercapture', () => {
-  if (buttons) release();
-});
-canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 const WHEEL_LINES_PER_NOTCH = 3;
 const WHEEL_PIXELS_PER_NOTCH = 100;
 const wheelRemainder = [0, 0];
@@ -626,26 +983,103 @@ function wheelNotches(e: WheelEvent, axis: 0 | 1): number {
   if (e.deltaMode === 2) return delta;
   return delta / WHEEL_PIXELS_PER_NOTCH;
 }
-canvas.addEventListener('wheel', (e) => {
-  e.preventDefault();
-  position(e);
-  for (const axis of [0, 1] as const) {
-    if (!(axis ? e.deltaX : e.deltaY)) continue;
-    const notches = wheelNotches(e, axis);
-    if (Math.sign(notches) !== Math.sign(wheelRemainder[axis])) wheelRemainder[axis] = 0;
-    wheelRemainder[axis] += notches;
-    const whole = Math.trunc(wheelRemainder[axis]);
-    if (!whole) continue;
-    wheelRemainder[axis] -= whole;
-    sendInput({ type: 'wheel', axis: axis ? 'horizontal' : 'vertical', delta: clamp(whole * 120, -1200, 1200), x, y });
-  }
-}, { passive: false });
-canvas.addEventListener('blur', release);
+/** Focuses whichever surface currently shows the stream, so keyboard input keeps reaching the desktop. */
+function focusSurface() {
+  (isRtcActive() ? video : canvas).focus();
+}
+/** Binds pointer, keyboard, wheel, focus, and blur input on one surface, so the canvas and the video both drive the desktop. */
+function bindSurface(surface: HTMLElement) {
+  surface.addEventListener('keydown', (e) => {
+    const code = mapKey(keys[e.code]);
+    if (!code) return;
+    if (paste.state !== 'idle' && e.code === 'KeyV') { e.preventDefault(); return; }
+    if (!e.repeat && holdBackPaste(e, code)) return;
+    e.preventDefault();
+    syncCaps(e);
+    if (e.code === 'CapsLock') return;
+    if (e.repeat || held.has(code)) return;
+    if (!holdKey(code)) return;
+    if (clipboardAvailable && !e.altKey && (e.ctrlKey || e.metaKey) && (e.code === 'KeyC' || e.code === 'KeyX')) {
+      expectRemoteCopy();
+    }
+    held.add(code);
+    if (code < 224) releaseLatched();
+  });
+  surface.addEventListener('keyup', (e) => {
+    const code = mapKey(keys[e.code]);
+    if (!code) return;
+    e.preventDefault();
+    syncCaps(e);
+    if (e.code === 'CapsLock') return;
+    if (!held.delete(code)) return;
+    if (!dropLatch(code)) releaseKey(code);
+  });
+  surface.addEventListener('pointermove', (e) => {
+    position(e);
+    sendInput({ type: 'pointerMove', x, y });
+  });
+  surface.addEventListener('pointerleave', () => { pointerPosition = null; renderCursor(); });
+  surface.addEventListener('pointerdown', (e) => {
+    const button = buttonMap[e.button];
+    if (!button) return;
+    e.preventDefault();
+    showPanel(null);
+    surface.focus();
+    position(e);
+    buttons |= 1 << (button - 1);
+    surface.setPointerCapture(e.pointerId);
+    sendInput({ type: 'buttonDown', button, x, y });
+  });
+  surface.addEventListener('pointerup', (e) => {
+    const button = buttonMap[e.button];
+    if (!button) return;
+    e.preventDefault();
+    position(e);
+    buttons &= ~(1 << (button - 1));
+    sendInput({ type: 'buttonUp', button, x, y });
+    if (!buttons && surface.hasPointerCapture(e.pointerId)) {
+      surface.releasePointerCapture(e.pointerId);
+    }
+  });
+  surface.addEventListener('pointercancel', release);
+  surface.addEventListener('lostpointercapture', () => {
+    if (buttons) release();
+  });
+  surface.addEventListener('contextmenu', (e) => e.preventDefault());
+  surface.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    position(e);
+    for (const axis of [0, 1] as const) {
+      if (!(axis ? e.deltaX : e.deltaY)) continue;
+      const notches = wheelNotches(e, axis);
+      if (Math.sign(notches) !== Math.sign(wheelRemainder[axis])) wheelRemainder[axis] = 0;
+      wheelRemainder[axis] += notches;
+      const whole = Math.trunc(wheelRemainder[axis]);
+      if (!whole) continue;
+      wheelRemainder[axis] -= whole;
+      sendInput({ type: 'wheel', axis: axis ? 'horizontal' : 'vertical', delta: clamp(whole * 120, -1200, 1200), x, y });
+    }
+  }, { passive: false });
+  surface.addEventListener('blur', release);
+  surface.addEventListener('focus', renderCursor);
+}
+bindSurface(canvas);
+bindSurface(video);
+new ResizeObserver(renderCursor).observe(canvas);
+window.addEventListener('scroll', renderCursor, { passive: true });
 window.addEventListener('blur', () => { release(); pointerPosition = null; renderCursor(); });
 const METRICS_UNAVAILABLE = 'Cgroup CPU (one core): unavailable · Cgroup RAM: unavailable';
-let hudTimer: any, metricsRequest: AbortController | null, configuredFps = 0;
+let hudTimer: any, metricsRequest: AbortController | null, configuredFps = 0, activeEncoder = '', activeTransferTier: string | number | null = null;
+/** Names the transport carrying the stream, so the HUD shows when the background upgrade took over. */
+function transportLabel(): string {
+  return isRtcActive() ? 'WebRTC' : 'WS';
+}
 function hudText(fps: number, mbps: number, metrics: string) {
-  const stream = `Stream ${canvas.width}x${canvas.height}${configuredFps ? ` @ ${configuredFps} fps` : ''}`;
+  const live = isRtcActive();
+  const width = live && video.videoWidth ? video.videoWidth : canvas.width;
+  const height = live && video.videoHeight ? video.videoHeight : canvas.height;
+  const encoder = [activeEncoder, activeTransferTier === null ? '' : `tier ${activeTransferTier}`].filter(Boolean).join(' · ');
+  const stream = `Stream ${width}x${height}${configuredFps ? ` @ ${configuredFps} fps` : ''}${encoder ? ` · ${encoder}` : ''} · ${transportLabel()}`;
   return `${stream} · Drawn FPS: ${fps.toFixed(1)} · Stream Mbps: ${mbps.toFixed(2)} · ${metrics}`;
 }
 function loadCapabilities() {
@@ -654,8 +1088,12 @@ function loadCapabilities() {
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
       if (Number.isFinite(data?.fps) && data.fps > 0) configuredFps = data.fps;
+      if (typeof data?.encoder === 'string') activeEncoder = data.encoder;
+      if (typeof data?.transfer_tier === 'string' || typeof data?.transfer_tier === 'number') activeTransferTier = data.transfer_tier;
       clipboardAvailable = data?.clipboard === true;
+      rtcOffered = data?.rtc === true;
       applyControl();
+      maybeProbeRtc();
     })
     .catch(() => {});
 }
@@ -716,6 +1154,8 @@ document.addEventListener('visibilitychange', () => {
     epoch++;
     retireDecoded();
     if (socket) socket.close();
+    abandonProbe('the page was hidden');
+    endRtc();
     reset();
     clearTimeout(retryTimer);
     if (reconnectMode === 'automatic') setStatus('Paused while hidden');
@@ -848,7 +1288,25 @@ function syncStatus() {
 new MutationObserver(syncStatus).observe(status, { childList: true, characterData: true, subtree: true });
 syncStatus();
 toggle.addEventListener('click', () => setExpanded(actions.hidden));
-canvas.addEventListener('pointerdown', () => showPanel(null));
+/** Downloads a canvas as a PNG named with the local time. */
+function saveScreenshot(source: HTMLCanvasElement) {
+  source.toBlob((blob) => {
+    if (!blob) return;
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `desktop-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }, 'image/png');
+}
+/** Saves a screenshot of the WebRTC stream, which never lands on the screen canvas. */
+function saveRtcScreenshot() {
+  const frame = document.createElement('canvas');
+  frame.width = video.videoWidth;
+  frame.height = video.videoHeight;
+  frame.getContext('2d')!.drawImage(video, 0, 0);
+  saveScreenshot(frame);
+}
 const toolbarActions: Record<string, (button: Element) => void> = {
   fullscreen: () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen())
     .catch(() => {}),
@@ -856,14 +1314,7 @@ const toolbarActions: Record<string, (button: Element) => void> = {
   clipboard: () => showPanel('clipboard'),
   keys: () => showPanel('keys'),
   connection: () => showPanel('connection'),
-  screenshot: () => canvas.toBlob((blob) => {
-    if (!blob) return;
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `desktop-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-  }, 'image/png'),
+  screenshot: () => (isRtcActive() && video.videoWidth ? saveRtcScreenshot() : saveScreenshot(canvas)),
   control: () => setViewOnly(!viewOnly),
   stats: (button) => {
     const panel = document.querySelector('#stats')!;
@@ -890,7 +1341,7 @@ panels.clipboard.addEventListener('click', (e) => {
     () => { if (current === clipboardEpoch) showPanel(null); },
     () => { if (current === clipboardEpoch) setStatus(pull ? 'Could not copy the remote clipboard' : 'Could not send the clipboard'); },
   );
-  canvas.focus();
+  focusSurface();
 });
 panels.scale.addEventListener('click', (e) => {
   const button = (e.target as Element).closest('[data-scale]');
@@ -906,7 +1357,7 @@ panels.keys.addEventListener('mousedown', keepCanvasFocus);
 panels.keys.addEventListener('click', (e) => {
   if ((e.target as Element).closest('#meta-ctrl')) {
     toggleMeta();
-    canvas.focus();
+    focusSurface();
     return;
   }
   const hold = (e.target as Element).closest('[data-hold]');
@@ -916,7 +1367,7 @@ panels.keys.addEventListener('click', (e) => {
       latched.set(code, hold);
       hold.setAttribute('aria-pressed', 'true');
     }
-    canvas.focus();
+    focusSurface();
     return;
   }
   const button = (e.target as Element).closest('[data-keys]');
@@ -927,7 +1378,7 @@ panels.keys.addEventListener('click', (e) => {
   for (const code of pressed.reverse()) releaseKey(code);
   if (codes.some((code) => code < 224)) releaseLatched();
   showPanel(null);
-  canvas.focus();
+  focusSurface();
 });
 function replaceAccess(value: string, next: Access) {
   clipboardAvailable = false;

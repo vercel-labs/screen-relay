@@ -87,7 +87,7 @@ Target viewerTarget(const std::string& target) {
 ConnectionPlan connectionPlan(Socket socket, size_t viewerCount, bool streamOwnsInput, bool controlOpen,
                               size_t grantViewerCount, bool grant, bool inputViewerHasGrant) {
   const bool idle = !streamOwnsInput && !controlOpen;
-  const bool replacing = socket == Socket::take && streamOwnsInput;
+  const bool replacing = socket == Socket::take && streamOwnsInput && (!grant || inputViewerHasGrant);
   const bool capacity = viewerCount < max_viewers || (viewerCount == max_viewers && replacing);
   const bool grantCapacity = !grant || grantViewerCount < max_viewers - 1 ||
                              (grantViewerCount == max_viewers - 1 && replacing && inputViewerHasGrant);
@@ -97,9 +97,23 @@ ConnectionPlan connectionPlan(Socket socket, size_t viewerCount, bool streamOwns
     case Socket::watch: return {capacity && grantCapacity, false, false};
     case Socket::stream: return {capacity && grantCapacity && idle, false, false};
     case Socket::take:
-      return capacity && grantCapacity ? ConnectionPlan{true, streamOwnsInput, controlOpen} : ConnectionPlan{};
+      return capacity && grantCapacity && (!grant || !streamOwnsInput || inputViewerHasGrant) ? ConnectionPlan{true, streamOwnsInput, controlOpen} : ConnectionPlan{};
   }
   return {};
+}
+bool rtcSessionAuthorized(bool callerIsOwner, uint64_t callerGrantId, uint64_t sessionGrantId) {
+  if (callerIsOwner) return true;
+  return callerGrantId != 0 && sessionGrantId != 0 && callerGrantId == sessionGrantId;
+}
+RtcAdmission rtcAdmission(size_t wsViewerCount, size_t wsGrantViewerCount,
+                          size_t rtcViewerCount, size_t rtcGrantViewerCount, uint64_t callerGrantId, bool hasReplaceableGrantRtc) {
+  const size_t total = wsViewerCount + rtcViewerCount;
+  if (!callerGrantId) return {total <= max_viewers, total == max_viewers};
+  const size_t grants = wsGrantViewerCount + rtcGrantViewerCount;
+  if (total < max_viewers && grants < max_viewers - 1) return {true, false};
+  const bool replace = hasReplaceableGrantRtc && rtcViewerCount && rtcGrantViewerCount &&
+                       total <= max_viewers && grants <= max_viewers - 1;
+  return {replace, replace};
 }
 bool frameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t lastSequence, const EncodedFrame& f,
                   uint16_t width, uint16_t height) {

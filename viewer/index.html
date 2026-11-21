@@ -14,6 +14,7 @@ body{font:13px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:#ededed}
 #screen{--w:1280;--h:720;display:block;margin:auto;flex:none;background:#000;outline:none;touch-action:none;cursor:default;
   width:min(100vw,calc(100vh*var(--w)/var(--h)));height:min(100vh,calc(100vw*var(--h)/var(--w)));
   width:min(100vw,calc(100dvh*var(--w)/var(--h)));height:min(100dvh,calc(100vw*var(--h)/var(--w)))}
+#video{flex:1;min-width:0;width:100%;height:100%;object-fit:contain;background:#000;outline:none;touch-action:none}
 body.actual #stage{overflow:auto}
 #cursor{position:fixed;pointer-events:none;z-index:1}
 #toolbar{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:3;display:flex;flex-direction:column;align-items:center;gap:6px}
@@ -45,7 +46,7 @@ button:focus-visible,input:focus-visible{outline:2px solid #3b82f6;outline-offse
 </style>
 </head>
 <body>
-<main id="stage"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="Remote desktop. Focus to send keyboard and pointer input."></canvas></main>
+<main id="stage"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="Remote desktop. Focus to send keyboard and pointer input."></canvas><video id="video" autoplay muted playsinline tabindex="0" aria-label="Remote desktop. Focus to send keyboard and pointer input." hidden></video></main>
 <canvas id="cursor" width="1" height="1" aria-hidden="true" hidden></canvas>
 <div id="stats" hidden><span id="hud" aria-label="Stream statistics">Stream 1280x720 · Drawn FPS: 0.0 · Stream Mbps: 0.00 · Cgroup CPU (one core): unavailable · Cgroup RAM: unavailable</span></div>
 <nav id="toolbar" aria-label="Viewer controls">
