@@ -11,7 +11,7 @@ import { engineDirectory, isLinux, LAUNCHER_DIR, requireHost, run, which, type H
 import { detectFamily, groupPackages, installCommand, packagesFor, provides } from './packages.js';
 import { claimLock, lockOwnerAlive } from './state.js';
 import { compiledBackends, findEngine, requestedBackend, sessionNeeds } from './supervisor.js';
-import { forgetMsys2Installation, MSYS2_PATH, msys2Failure, msys2Installation, msys2Shell, repairMsys2, wingetPath } from './windows.js';
+import { createPrivateMsys2Root, MSYS2_PATH, MSYS2_ROOT, msys2Failure, msys2Installation, msys2Libraries, msys2Shell, wingetPath } from './windows.js';
 
 type Backend = (typeof BACKENDS)[number];
 type Args = HostArgs & Record<string, any>;
@@ -55,7 +55,7 @@ export function planSetup(request: Request): Plan {
   const backends = BACKENDS.filter((backend) => compiled.includes(backend) || request.backends.includes(backend));
   const programs = request.backends.flatMap((backend) => sessionNeeds(backend, request).missing)
     .filter((program) => provides(program === 'swaymsg' ? 'sway' : program));
-  const untrusted = process.platform === 'win32' && msys2Installation().state === 'untrusted';
+  const untrusted = process.platform === 'win32' && msys2Libraries().state === 'untrusted';
   const packages = programs.length > 0 || untrusted || (build && !buildable(backends));
   const xfce = request.backends.includes('x11') && sessionNeeds('x11', request).desktop === 'xfce';
   const groups = ['core', ...backends, ...(xfce ? ['xfce'] : [])];
@@ -115,16 +115,30 @@ function packageWork(groups: string[], args: Args): { manager: string; packages:
       run: async () => {
         if (installation.state === 'untrusted') throw msys2Failure(installation);
         if (installation.state === 'missing') {
+          if (existsSync(MSYS2_ROOT)) {
+            throw new Failure('missing_dependency', `${MSYS2_ROOT} appeared before setup could install MSYS2`, `Delete ${MSYS2_ROOT} and run screen-relay install again.`);
+          }
           const winget = wingetPath();
           if (!winget || run([winget, '--version']).status !== 0) {
-            throw new Failure('missing_dependency', 'MSYS2 is not installed, and winget is not available to install it', 'Install MSYS2 from https://www.msys2.org, then run screen-relay install again.');
+            throw new Failure('missing_dependency', 'MSYS2 is not installed, and winget is not available to install it', 'Install App Installer, or install MSYS2 from https://www.msys2.org with the access rules in the Windows guide, then run screen-relay install again.');
           }
-          await step('Installing MSYS2', 'Installed MSYS2', `winget ${WINGET_MSYS2.join(' ')}`, args, true, [winget, ...WINGET_MSYS2]);
-          forgetMsys2Installation();
-          if (msys2Installation().state === 'untrusted' && !args.json) process.stderr.write('Removing the rights C:\\msys64 inherits from C:\\\n');
-          repairMsys2();
+          const discardRoot = createPrivateMsys2Root();
+          if (!discardRoot) {
+            throw new Failure('missing_dependency', `Setup could not create a private ${MSYS2_ROOT}`, `Run screen-relay install from an elevated terminal. If ${MSYS2_ROOT} exists, delete it first.`);
+          }
+          try {
+            await step('Installing MSYS2', 'Installed MSYS2', `winget ${WINGET_MSYS2.join(' ')}`, args, true, [winget, ...WINGET_MSYS2]);
+          } catch (error) {
+            if (!discardRoot() && error instanceof Failure) {
+              throw new Failure(error.reason, error.message, `Check ${MSYS2_ROOT} before retrying. Back up any files you need, then remove the incomplete installation and run screen-relay install again.`, error.data);
+            }
+            throw error;
+          }
           const installed = msys2Installation();
-          if (installed.state !== 'trusted') throw msys2Failure(installed);
+          if (installed.state !== 'trusted') {
+            if (discardRoot()) throw new Failure('missing_dependency', 'winget reported success but did not install MSYS2', 'Install MSYS2 with the manual steps at https://screen-relay.dev/docs/windows#install-msys2-manually, then run screen-relay install again.');
+            throw msys2Failure(installed);
+          }
         }
         const keyring = '{ [ -d /etc/pacman.d/gnupg ] || { pacman-key --init && pacman-key --populate msys2 && gpgconf --kill all; }; }';
         await step('Installing MSYS2 packages', 'Installed MSYS2 packages', `${keyring} && pacman -Sy --noconfirm --needed ${MSYS2_PACKAGES.join(' ')}`, args);

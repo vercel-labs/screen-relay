@@ -17,7 +17,7 @@ after(() => rmSync(directory, { recursive: true, force: true }));
 
 const bundle = buildSync({
   stdin: {
-    contents: "export { cmdDoctor } from './src/cli/host/doctor.ts'; export { cmdInstall } from './src/cli/host/setup.ts'; export { cmdDown, cmdLogs, cmdRun, cmdUp } from './src/cli/host/session_commands.ts'; export { engineDirectory, requireHost, which } from './src/cli/host/common.ts'; export { compiledBackends, findEngine, requestedBackend, Session } from './src/cli/host/supervisor.ts'; export { alive, identity, lock, stateDir, writeSession } from './src/cli/host/state.ts'; export { engineEnvironment, killTree, MSYS2_CHECKED, MSYS2_PATH, msys2Fix, msys2Repair, msys2Shell, repairCommand, trustedAcl, windowsSessionId } from './src/cli/host/windows.ts';",
+    contents: "export { cmdDoctor } from './src/cli/host/doctor.ts'; export { cmdInstall } from './src/cli/host/setup.ts'; export { cmdDown, cmdLogs, cmdRun, cmdUp } from './src/cli/host/session_commands.ts'; export { engineDirectory, requireHost, which } from './src/cli/host/common.ts'; export { compiledBackends, findEngine, requestedBackend, Session } from './src/cli/host/supervisor.ts'; export { alive, identity, lock, stateDir, writeSession } from './src/cli/host/state.ts'; export { createPrivateMsys2Root, engineEnvironment, killTree, MSYS2_PATH, msys2Fix, msys2Shell, probeMsys2Tree, trustedAcl, windowsSessionId } from './src/cli/host/windows.ts';",
     resolveDir: root,
   },
   bundle: true,
@@ -29,7 +29,7 @@ const bundle = buildSync({
 });
 const bundlePath = join(directory, 'windows.mjs');
 writeFileSync(bundlePath, bundle.outputFiles[0].contents);
-const { alive, cmdDown, cmdInstall, cmdLogs, cmdRun, cmdUp, compiledBackends, engineDirectory, engineEnvironment, findEngine, identity, killTree, lock, MSYS2_CHECKED, MSYS2_PATH, msys2Fix, msys2Repair, msys2Shell, repairCommand, requestedBackend, requireHost, Session, stateDir, trustedAcl, which, windowsSessionId, writeSession } = await import(pathToFileURL(bundlePath).href);
+const { alive, cmdDown, cmdInstall, cmdLogs, cmdRun, cmdUp, compiledBackends, createPrivateMsys2Root, engineDirectory, engineEnvironment, findEngine, identity, killTree, lock, MSYS2_PATH, msys2Fix, msys2Shell, probeMsys2Tree, requestedBackend, requireHost, Session, stateDir, trustedAcl, which, windowsSessionId, writeSession } = await import(pathToFileURL(bundlePath).href);
 
 function onWindowsProcess(script) {
   const probe = `Object.defineProperty(process, 'platform', { value: 'win32' });
@@ -140,7 +140,7 @@ const MODIFY = 197055;
 
 test('an MSYS2 tree owned by another account is refused, and the owner is named', () => {
   const verdict = trustedAcl({ current: ACCOUNT, objects: [{ path: 'C:\\msys64', kind: 'directory', owner: OTHER, ownerName: 'DESKTOP\\other', rules: [] }] });
-  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64 is owned by DESKTOP\\other.', owned: false });
+  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64 is owned by DESKTOP\\other.' });
 });
 
 test('an MSYS2 tree that another account can write to is refused, and the path and account are named', () => {
@@ -149,7 +149,7 @@ test('an MSYS2 tree that another account can write to is refused, and the path a
     { path: 'C:\\msys64', kind: 'directory', owner: SYSTEM, ownerName: 'NT AUTHORITY\\SYSTEM', rules },
     { path: 'C:\\msys64\\usr\\bin', kind: 'directory', owner: SYSTEM, ownerName: 'NT AUTHORITY\\SYSTEM', rules },
   ] });
-  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64 lets BUILTIN\\Users write to it.', owned: true });
+  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64 lets BUILTIN\\Users write to it.' });
 });
 
 test('a tree that the signed-in account, SYSTEM or Administrators owns and no other account can write to is trusted', () => {
@@ -159,11 +159,10 @@ test('a tree that the signed-in account, SYSTEM or Administrators owns and no ot
     { sid: USERS, name: 'BUILTIN\\Users', rights: READ },
     { sid: 'S-1-3-0', name: 'CREATOR OWNER', rights: FULL },
   ];
-  const directoryRules = [...rules, { sid: USERS, name: 'BUILTIN\\Users', rights: CREATE_DIRECTORY }];
   const directories = ['C:\\msys64', 'C:\\msys64\\usr', 'C:\\msys64\\usr\\bin'];
   for (const owner of [ACCOUNT, SYSTEM, ADMINISTRATORS]) {
     const objects = [
-      ...directories.map((path) => ({ path, kind: 'directory', owner, ownerName: 'owner', rules: directoryRules })),
+      ...directories.map((path) => ({ path, kind: 'directory', owner, ownerName: 'owner', rules })),
       { path: 'C:\\msys64\\usr\\bin\\bash.exe', kind: 'file', owner, ownerName: 'owner', rules },
     ];
     assert.deepEqual(trustedAcl({ current: ACCOUNT, objects }), { trusted: true });
@@ -173,7 +172,13 @@ test('a tree that the signed-in account, SYSTEM or Administrators owns and no ot
 test('a file that another account can append to is refused, since the login profile runs it', () => {
   const rules = [{ sid: USERS, name: 'BUILTIN\\Users', rights: CREATE_DIRECTORY }];
   const verdict = trustedAcl({ current: ACCOUNT, objects: [{ path: 'C:\\msys64\\etc\\profile', kind: 'file', owner: SYSTEM, ownerName: 'NT AUTHORITY\\SYSTEM', rules }] });
-  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64\\etc\\profile lets BUILTIN\\Users write to it.', owned: true });
+  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64\\etc\\profile lets BUILTIN\\Users write to it.' });
+});
+
+test('a directory that another account can create subdirectories in is refused, since the tree covers what they add', () => {
+  const rules = [{ sid: USERS, name: 'BUILTIN\\Users', rights: CREATE_DIRECTORY }];
+  const verdict = trustedAcl({ current: ACCOUNT, objects: [{ path: 'C:\\msys64', kind: 'directory', owner: SYSTEM, ownerName: 'NT AUTHORITY\\SYSTEM', rules }] });
+  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64 lets BUILTIN\\Users write to it.' });
 });
 
 test('a rule that grants another account a generic write right is refused', () => {
@@ -183,33 +188,77 @@ test('a rule that grants another account a generic write right is refused', () =
   }
 });
 
-test('an MSYS2 tree with trusted owners and a loose rule gets the icacls repair in its fix, with no backticks', () => {
-  const fix = msys2Fix({ state: 'untrusted', root: 'C:\\msys64', reason: 'C:\\msys64 lets BUILTIN\\Users write to it.', repair: repairCommand(ACCOUNT) });
+test('an MSYS2 path that is a reparse point is refused', () => {
+  const verdict = trustedAcl({ current: ACCOUNT, objects: [{ path: 'C:\\msys64\\usr', kind: 'directory', reparse: true, owner: SYSTEM, ownerName: 'NT AUTHORITY\\SYSTEM', rules: [] }] });
+  assert.deepEqual(verdict, { trusted: false, reason: 'C:\\msys64\\usr is a reparse point.' });
+});
+
+test('an MSYS2 tree with a loose rule gets a delete-and-reinstall fix without icacls', () => {
+  const fix = msys2Fix({ state: 'untrusted', root: 'C:\\msys64', reason: 'C:\\msys64 lets BUILTIN\\Users write to it.' });
   assert.match(fix, /lets BUILTIN\\Users write to it\./);
-  assert.ok(fix.includes(`icacls C:\\msys64 /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${ACCOUNT}:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"`), fix);
-  assert.match(fix, /delete C:\\msys64 and run screen-relay install again/);
+  assert.match(fix, /Do not run any program from C:\\msys64\. Back up any files you need, delete C:\\msys64, and run screen-relay install again/);
+  assert.ok(!fix.includes('icacls'));
+  assert.ok(!fix.includes('uninstall'));
   assert.ok(!fix.includes('`'));
 });
 
-test('setup searches only the MSYS2 directories it checks, with usr\\local\\bin first', () => {
-  assert.equal(MSYS2_PATH.split(':')[0], '/usr/local/bin');
-  const checked = new Set(MSYS2_CHECKED.map((path) => path.toLowerCase()));
-  for (const directory of MSYS2_PATH.split(':')) {
-    assert.ok(checked.has(`c:\\msys64${directory.replaceAll('/', '\\')}`.toLowerCase()), `${directory} is searched but not checked`);
-  }
-});
-
-test('a tree that an Entra account owns gets the icacls repair', () => {
-  const account = 'S-1-12-1-987654321-1234567890-987654321-1234567890';
-  assert.deepEqual(msys2Repair(true, account), repairCommand(account));
-  assert.equal(msys2Repair(true, ''), undefined);
-  assert.equal(msys2Repair(false, account), undefined);
-});
-
-test('an MSYS2 tree owned by another account can only be deleted', () => {
-  const fix = msys2Fix({ state: 'untrusted', root: 'C:\\msys64', reason: 'C:\\msys64 is owned by DESKTOP\\other.', owned: false });
+test('an MSYS2 tree owned by another account gets the same delete-and-reinstall fix', () => {
+  const fix = msys2Fix({ state: 'untrusted', root: 'C:\\msys64', reason: 'C:\\msys64 is owned by DESKTOP\\other.' });
+  assert.match(fix, /is owned by DESKTOP\\other\./);
+  assert.match(fix, /Do not run any program from C:\\msys64\. Back up any files you need, delete C:\\msys64, and run screen-relay install again/);
   assert.ok(!fix.includes('icacls'));
-  assert.match(fix, /delete C:\\msys64 and run screen-relay install again/);
+});
+
+test('setup searches the MSYS2 command directories in its own order', () => {
+  assert.deepEqual(MSYS2_PATH.split(':'), ['/usr/local/bin', '/usr/bin', '/ucrt64/bin']);
+});
+
+test('a private MSYS2 root and its real children read as trusted, and each child ACL is read on its own', { skip: process.platform !== 'win32' }, () => {
+  const parent = mkdtempSync(join(directory, 'msys2-private-'));
+  const root = join(parent, 'root');
+  try {
+    const discard = createPrivateMsys2Root(root);
+    assert.equal(typeof discard, 'function');
+    const rootProbe = probeMsys2Tree(root);
+    assert.ok(rootProbe);
+    assert.deepEqual(trustedAcl(rootProbe), { trusted: true });
+    const shell = join(root, 'usr', 'bin', 'bash.exe');
+    assert.equal(probeMsys2Tree(root, shell), null);
+
+    const bin = join(root, 'usr', 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(shell, '');
+    const treeProbe = probeMsys2Tree(root, shell);
+    assert.ok(treeProbe);
+    assert.deepEqual(trustedAcl(treeProbe), { trusted: true });
+    const objectAt = (probe, path) => probe.objects.find((object) => object.path.replace(/[\\/]+$/, '').toLowerCase() === path.replace(/[\\/]+$/, '').toLowerCase());
+    assert.equal(objectAt(treeProbe, shell)?.kind, 'file');
+
+    const nested = join(root, 'opt');
+    mkdirSync(nested);
+    const icacls = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'icacls.exe');
+    const applied = spawnSync(icacls, [nested, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', `*${rootProbe.current}:(OI)(CI)F`], { encoding: 'utf8' });
+    assert.equal(applied.status, 0, applied.stderr);
+    const nestedFile = join(nested, 'note.txt');
+    writeFileSync(nestedFile, '');
+    const nestedProbe = probeMsys2Tree(root);
+    assert.ok(nestedProbe);
+    assert.deepEqual(trustedAcl(nestedProbe), { trusted: true });
+    const nestedObject = objectAt(nestedProbe, nested);
+    const nestedFileObject = objectAt(nestedProbe, nestedFile);
+    const rootObject = objectAt(nestedProbe, root);
+    assert.ok(nestedObject);
+    assert.ok(nestedFileObject);
+    assert.ok(rootObject);
+    assert.notDeepEqual(nestedObject.rules, rootObject.rules);
+
+    rmSync(join(root, 'usr'), { recursive: true, force: true });
+    rmSync(nested, { recursive: true, force: true });
+    assert.equal(discard(), true);
+    assert.equal(existsSync(root), false);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test('setup refuses an MSYS2 shell it cannot vouch for', { skip: process.platform === 'win32' }, async () => {
@@ -404,16 +453,46 @@ test('install on Windows without MSYS2 or winget names MSYS2 and its download pa
   await withEnv('LOCALAPPDATA', undefined, () => onPlatform('win32', () => assert.rejects(cmdInstall({ command: 'install', json: true, name: 'default', backend: 'windows', yes: true }), { reason: 'missing_dependency', message: /MSYS2/, hint: /https:\/\/www\.msys2\.org/ })));
 });
 
+test('Windows bootstrap retries only when its installer left the new root empty', { skip: process.platform === 'win32' }, () => {
+  for (const mode of ['failed', 'missing-shell', 'partial', 'preexisting']) {
+    const cwd = join(directory, `bootstrap-${mode}`);
+    const system = join(cwd, 'system');
+    const appData = join(cwd, 'appdata');
+    const powershell = join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const icacls = join(system, 'System32', 'icacls.exe');
+    const winget = join(appData, 'Microsoft', 'WindowsApps', 'winget.exe');
+    const marker = join(cwd, 'calls');
+    const msysRoot = join(cwd, 'C:\\msys64');
+    mkdirSync(cwd, { recursive: true });
+    for (const path of [powershell, icacls, winget]) mkdirSync(join(path, '..'), { recursive: true });
+    const probe = { current: 'S-1-5-21-123', objects: [{ path: 'C:\\msys64', directory: true, reparse: false, owner: 'S-1-5-21-123', rules: [] }] };
+    writeFileSync(powershell, `#!/bin/sh\nprintf '%s' '${JSON.stringify(probe)}'\n`, { mode: 0o755 });
+    writeFileSync(icacls, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(winget, `#!/bin/sh\n[ "$1" = --version ] && exit 0\necho install >> ${JSON.stringify(marker)}\n${mode === 'partial' ? `touch ${JSON.stringify(join(msysRoot, 'partial'))}\n` : ''}exit ${mode === 'missing-shell' ? 0 : 1}\n`, { mode: 0o755 });
+    if (mode === 'preexisting') mkdirSync(msysRoot);
+    const script = `Object.defineProperty(process, 'platform', { value: 'win32' });
+const { cmdInstall } = await import(${JSON.stringify(pathToFileURL(bundlePath).href)});
+for (let i = 0; i < 2; i++) {
+  try { await cmdInstall({ command: 'install', json: true, name: 'default', backend: 'windows', yes: true }); }
+  catch (error) { console.log(JSON.stringify({ message: error.message, hint: error.hint })); }
+}`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd, encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, SystemRoot: system, LOCALAPPDATA: appData, XDG_DATA_HOME: join(cwd, 'data'), XDG_STATE_HOME: join(cwd, 'state'), XDG_CONFIG_HOME: join(cwd, 'config') },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const errors = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(errors.length, 2);
+    const calls = existsSync(marker) ? readFileSync(marker, 'utf8').trim().split('\n').length : 0;
+    assert.equal(calls, mode === 'preexisting' ? 0 : mode === 'partial' ? 1 : 2, mode);
+    assert.equal(existsSync(msysRoot), mode === 'partial' || mode === 'preexisting', mode);
+    if (mode === 'partial') assert.match(errors[0].hint, /incomplete installation/);
+    if (mode === 'missing-shell') assert.match(errors[0].hint, /install-msys2-manually/);
+  }
+});
+
 test('install on Windows reports unchanged when the engine already has the windows backend', { skip: process.platform === 'win32' }, () => {
   writeEngine('#!/bin/sh\nif [ "$1" = --help ]; then echo \'Compiled backends: windows\'; exit 0; fi\nexit 1\n');
   const result = onWindowsProcess(`await cmdInstall({ command: 'install', json: true, name: 'default', backend: 'windows' });`);
   assert.equal(JSON.parse(result.stdout).outcome, 'unchanged');
-});
-
-test('install on Windows stops at the winget step and says to run install again', { skip: process.platform === 'win32' }, async () => {
-  withoutEngine();
-  const localAppData = join(home, 'local-app-data');
-  mkdirSync(join(localAppData, 'Microsoft', 'WindowsApps'), { recursive: true });
-  writeFileSync(join(localAppData, 'Microsoft', 'WindowsApps', 'winget.exe'), '#!/bin/sh\n[ "$1" = --version ] && exit 0\nexit 1\n', { mode: 0o755 });
-  await withEnv('LOCALAPPDATA', localAppData, () => onPlatform('win32', () => assert.rejects(cmdInstall({ command: 'install', json: true, name: 'default', backend: 'windows', yes: true }), { reason: 'missing_dependency', message: /Installing MSYS2/, hint: /run `screen-relay install` again/ })));
 });
