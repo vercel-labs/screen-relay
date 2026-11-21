@@ -38,6 +38,8 @@ clipboard(): Promise<string>                       // clipboard text, '' when it
 setClipboard(text): Promise<void>                  // UTF-8, up to 256 KiB; '' clears it
 ```
 
+`Capabilities` includes `encoder` (the active encoder's name), `hardware_encoder`, `encoder_state`, `rtc` (whether WebRTC is available), `ice_servers` (how many are configured), and `transfer_tier` (`zero_copy`, `dirty_upload`, `full_upload`, or `software`). `auto` keeps a hardware encoder while it holds the frame budget and adapts back to `x264` when it fails or falls behind, so `encoder` can change during a session.
+
 ## connect
 
 `connect(options)` opens a control session that owns input until `close()`.

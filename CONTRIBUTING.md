@@ -8,12 +8,12 @@ For the wire format, see [screen-relay wire protocol](PROTOCOL.md).
 
 | Path | Contents |
 | --- | --- |
-| `src/engine/core/` | Backend-neutral pipeline: `CaptureSource`, the input controller and input backend interface, encoder, color conversion, flow control, and the platform `wait` that blocks the capture loop |
-| `src/engine/server/` | `main.cpp` (entry point), `config` (arguments, token and origin policy), `wire` (NSL1 encoding), `server` (session, writes, libwebsockets callback, HTTP routes), `metrics` (cgroup parsing), `screenshot` |
+| `src/engine/core/` | Backend-neutral pipeline: `CaptureSource`, the input controller and input backend interface, the `VideoEncoder` interface and `EncoderController` state machine with their x264 and libavcodec backends, color conversion, flow control, and the platform `wait` that blocks the capture loop |
+| `src/engine/server/` | `main.cpp` (entry point), `config` (arguments, ICE server parsing, token and origin policy), `wire` (NSL1 encoding), `server` (session, writes, libwebsockets callback, HTTP routes), `stream-hub` (one shared capture and encode pipeline for every viewer), `rtc` (opt-in WebRTC viewer), `metrics` (cgroup parsing), `screenshot` |
 | `src/engine/backends/linux/x11/` | X11 capture (XDamage, MIT-SHM, XFixes cursor) and XTest input primitives |
 | `src/engine/backends/linux/wayland/` | Wayland capture (wlr-screencopy), virtual keyboard and pointer input, Unicode keymap |
 | `src/engine/backends/windows/` | Windows capture (Desktop Duplication, shared per display, mipmap downscaling) and SendInput input primitives |
-| `src/engine/backends/macos/` | macOS capture (ScreenCaptureKit, shared per display), CGEvent input primitives, and display and permission checks |
+| `src/engine/backends/macos/` | macOS capture (ScreenCaptureKit, shared per display), `vt_encoder.mm` (VideoToolbox hardware encoder), CGEvent input primitives, and display and permission checks |
 | `src/protocol/` | Runtime-neutral wire constants, input encoding, server message parsing, socket targets, HID key table, key-combo and text parsing, origin and token rules. Built without Node imports and exported as `screen-relay/protocol`. |
 | `src/sdk/` | Node client library on top of the protocol |
 | `src/cli/` | The `screen-relay` CLI: argument parsing, output, client commands on the SDK, host commands that supervise the display, desktop, and engine |
@@ -25,29 +25,60 @@ For the wire format, see [screen-relay wire protocol](PROTOCOL.md).
 ```text
 X11 display (Xvfb) or Wayland compositor (headless sway or attached)
   -> CaptureSource (X11: MIT-SHM, XDamage, XFixes cursor; Wayland: wlr-screencopy)
-  -> CaptureEncoder (BGRA/ARGB to NV12, x264)
-  -> flow control (ACK credit)
-  -> WebSocket /stream
-  -> browser VideoDecoder -> canvas
+  -> EncoderController -> VideoEncoder (VideoToolbox or libavcodec hardware, else x264)
+  -> StreamHub (per-viewer wire sequence, ACK credit)
+  -> WebSocket /stream -> browser VideoDecoder -> canvas
+  -> WebRTC /rtc        -> browser video element
 
-browser input over /stream
+browser input over /stream, or over the WebRTC input data channel
 agent or CLI/SDK input over /input (HTTP) or /control (WebSocket)
   -> InputController -> InputBackend (X11: XTest; Wayland: virtual keyboard + virtual pointer v2)
   -> selected display
 ```
 
-Only one of the viewer, `/control`, and `/input` owns input at a time.
+Only one of the viewers, `/control`, and `/input` owns input at a time. A WebRTC viewer counts as a viewer, and several WebRTC viewers can hold a session each.
 
 `connectionPlan` in `src/engine/server/wire.cpp` is the connection state machine: it decides whether a new `/stream` or `/control` socket opens and which open socket it closes, and `server-test` checks every row of its table.
 
+## Encoder
+
+One `EncoderController` in `src/engine/core/encoder.cpp` owns the encoder for every viewer.
+
+| State | Meaning |
+| --- | --- |
+| `uninitialized` | No encoder has been opened. |
+| `probing` | A hardware encoder is open and its first frame is under test. |
+| `hardware_active` | A hardware encoder is publishing frames. |
+| `hardware_degraded` | The hardware encoder failed and x264 is taking over. |
+| `software_active` | x264 is publishing frames. |
+| `failed` | No encoder can continue, so the engine stops. |
+
+`stream.encoder`, `--encoder`, and `SCREEN_RELAY_ENCODER` set the preference. `auto` tries VideoToolbox first on macOS, then the libavcodec candidates, keeps a hardware encoder while it holds the frame budget set by `stream.fps`, and adapts back to x264 when it fails or falls behind. `x264` opens the software encoder only. Any other name pins that encoder through the hardware factory and falls back to x264 only when it errors.
+
+A candidate passes only when it encodes a forced IDR that carries AVC IDR, SPS, and PPS NAL units. The probe records the stream's `profile-level-id` and resets the encoder. A candidate that fails the probe gets a 30 second cooldown, and `auto` continues with the next one.
+
+`libav_encoder.cpp` probes `h264_nvenc`, then `h264_vaapi` and `h264_qsv` on Linux, or `h264_qsv` and `h264_amf` on Windows. It is built only when `libavcodec` and `libavutil` are present at build time. `vt_encoder.mm` hands VideoToolbox a `CVPixelBuffer` from the capture source.
+
+Runtime failures follow one path:
+
+- The first transient hardware failure resets the encoder and retries with an IDR.
+- For a hardware encoder, a forced IDR without IDR, SPS, or PPS, a dropped forced IDR, a failed submit, or 15 consecutive dropped frames marks a 30 second cooldown, increments the fallback count, and switches to x264 with a fresh IDR.
+- Three consecutive software failures move to `failed` and stop the engine.
+
+`CaptureStats` reports `encoder`, `hardware_encoder`, `encoder_state`, `dropped_frames`, and `fallback_count`. `GET /capabilities` exposes the first three, and the engine prints the counters at shutdown.
+
 ## Interfaces
 
-- `CaptureSource` (`src/engine/core/capture-source.hpp`): `fd()`, `dimensions()`, `drainDamage()`, `pixelFormat()`, `capture()`. A frame is a non-owning CPU view (BGRA or ARGB), valid until the next capture. Optional `cursorSupported()` and `cursor(force)`.
+- `CaptureSource` (`src/engine/core/capture-source.hpp`): `fd()`, `dimensions()`, `drainDamage()`, `pixelFormat()`, `capture()`. A frame is a non-owning CPU view (BGRA or ARGB), valid until the next capture. `captureNative(full)` may attach an OS GPU handle in `FrameView::native_handle` for a zero-copy encoder. Optional `cursorSupported()` and `cursor(force)`.
+- `VideoEncoder` (`src/engine/core/encoder.hpp`): `name()`, `hardware()`, `inputFormat()` (`nv12`, `bgra`, or `native_handle`), `maxInflight()`, `planes()`, `submit(request)`, `poll(results, wait)`, `flush(results)`, and `reset(error)`. Software encoders complete a frame before `submit` returns; hardware encoders pipeline frames and call the ready callback.
+- `EncoderController` (`src/engine/core/encoder.hpp`): owns one `VideoEncoder`, probes candidates, counts drops and failures, applies cooldowns, and moves between the states in [Encoder](#encoder). `evaluate()` turns one `EncodeResult` into an `EncoderDecision` (`publish`, `drop`, `recover_idr`, or `fatal`), so every transition happens in one place.
+- `StreamHub` (`src/engine/server/stream-hub.hpp`): owns the single `CaptureEncoder` and one `Subscriber` per viewer, covering WebSocket viewers and each WebRTC session. Each subscriber has its own `ViewerState` (`disconnected`, `awaiting_idr`, `streaming`, `closing`), its own wire sequence, and its own `FlowControl`. The hub picks one driver for encoder flow control: the controlling viewer, else a watching viewer, else a WebRTC subscriber.
+- `RtcSession` (`src/engine/server/rtc.hpp`): one explicit state machine (`idle`, `gathering`, `connecting`, `connected`, `closing`, `closed`) around one peer connection. It takes the offer, gathers ICE candidates on its own thread, pushes shared frames once the H.264 track opens, and drains 16-byte input records from the `input` data channel. The `events` data channel carries cursor updates, owner clipboard notices, and viewer ACKs.
 - `InputBackend` (`src/engine/core/input.hpp`): platform primitives only: `nativeKey(usage)`, `pressKey`, `releaseKey`, `typeText(codepoint)`, `pressButton`, `releaseButton`, `move`, `scroll`, `resetLocks`, `fence(mark)`, `pending`, `cancel`, `flush`, `dimensions`, `name`. A backend may queue its work on its own thread. `pending` counts the events still queued, and the service thread refuses a batch that would take the queue past 1024 events. `fence` completes a caller's `InputFence` after everything posted before it. `cancel` drops queued text and moves as not applied while keeping key and button releases, and reports how many records were dropped.
 - `InputController` (`src/engine/core/input.hpp`): owns one `InputBackend`, validates each `InputEvent`, maps normalized pointer coordinates to pixels, dedupes held keys and buttons by native key id, and releases everything on `releaseAll`. `resetLocks` turns Caps Lock off when a new input session starts. It forwards `fence` and `cancel` to the backend and returns `InputStatus`: `invalid` for a rejected event, `unsupported` when the backend has no native key for a usage or cannot type a codepoint.
 - `InputQueue` (`src/engine/core/input.hpp`): the backend work queue. It counts one protocol record as one queued unit however many platform jobs that record posts, so admission, `pending`, and cancelled-record counts share one unit. `cancel` drops queued text and moves and leaves each fence it covered in worker order, so the worker completes it as not applied after the backend's fence.
 - `ClipboardBackend` (`src/engine/core/clipboard.hpp`): `read` and `write` UTF-8 text with LF line endings, each returning within about two seconds. The factory takes a `ClipboardChanged` callback that the backend calls on its own thread after every clipboard change, and returns null when the desktop has no usable clipboard. The server runs requests on one worker (`ClipboardWorker`), so a slow clipboard owner never blocks the service thread. X11 and Wayland use their own connection and thread; Windows uses a message-only window on its own thread; macOS polls the pasteboard change count every 250 ms.
-- `CaptureEncoder` takes a `CaptureSourceFactory`, so tests can inject a source with no X11.
+- `CaptureEncoder` takes a `CaptureSourceFactory`, so tests can inject a source with no X11, and an optional `EncoderFactories` pair so tests can inject encoders. It publishes `std::shared_ptr<const EncodedFrame>` and exposes `requestKeyframe()`.
 - The worker requires a valid fd. Core enforces the source size limits once, in the capture worker and on the input backend's dimensions at startup: width 320 to 16384 and height 240 to 16384, both even, which is the largest frame libx264 accepts. The image stride must be between width x 4 and width x 8 bytes.
 
 ## Threads and ownership
@@ -56,7 +87,9 @@ Only one of the viewer, `/control`, and `/input` owns input at a time.
 - On Linux, input work runs on a thread that owns the backend connection. The service thread only queues events, so it never waits for a slow character. The `/input` and `/control` replies follow a backend fence (XSync on X11 and a Wayland roundtrip on Wayland), which gives clients backpressure and keeps `applied` true.
 - On macOS, the input worker thread posts CGEvents from a private event source. Its fence completes after the events queued before it are posted, and it reports `applied` as false when the process lacks event posting permission.
 - Shutdown destroys the input controller and joins its thread before the libwebsockets context is destroyed. The thread wakes the service thread through a shared context holder that is cleared first.
-- The capture worker owns its `CaptureSource`, a reusable YUV frame, and the x264 encoder. It publishes owning `EncodedFrame` vectors to a bounded queue and wakes the service thread with `lws_cancel_service`.
+- The capture worker owns its `CaptureSource`, reusable input frames, and the `EncoderController`. It publishes `std::shared_ptr<const EncodedFrame>` to `StreamHub`, which wakes the service thread with `lws_cancel_service`.
+- `StreamHub` maps each encoded frame to a per-viewer wire sequence number, so one encode serves every viewer.
+- A WebRTC session gathers ICE candidates on its own thread and hands its answer back through the wake callback. It receives frames from a `StreamHub` subscriber and applies input records on the service thread.
 - A separate screenshot worker owns its own `CaptureSource`. On macOS, the video and screenshot sources read one shared ScreenCaptureKit stream.
 - Each X11 backend object owns its own X connection. Xlib threading is initialized once by `initializeNativeBackend()`.
 - Workers finish before the resources they use are destroyed.
@@ -78,9 +111,11 @@ Only one of the viewer, `/control`, and `/input` owns input at a time.
 | Decrease | Without TCP statistics: target x 0.75 (and at most 90% of measured goodput) when 2+ frames and enough bytes are outstanding, the standing network queue is at least half the pause queue, and 500 ms since the last decrease. The floor is the configured minimum. |
 | Increase | Without TCP statistics: target x 1.10 after a busy 1 s sample, the standing network queue is below a quarter of the pause queue, 1 s since last increase, 2 s since last decrease. |
 
-Engine flags: `--fps` takes 10 to 120. `--bitrate-min`, `--bitrate-start`, and `--bitrate-max` take bits per second with `250000 <= min <= start <= max <= 100000000`. `relay-engine --help` lists them with their defaults.
+Engine flags: `--fps` takes 10 to 240. `--bitrate-min`, `--bitrate-start`, and `--bitrate-max` take bits per second with `250000 <= min <= start <= max <= 100000000`. `relay-engine --help` lists them with their defaults.
 
 Each ACK carries the time the frame spent in the viewer, from arrival until it was drawn or superseded. The engine subtracts that wait from the capture-to-ACK time to estimate how much of the delay is in the network.
+
+When the WebRTC subscriber drives the stream, the encoder uses a fixed 4-frame window at `start_bitrate`, because the peer connection paces the media itself.
 
 Quality recovery: when the picture is unchanged for 150 ms, the capture worker re-encodes the full picture as a P frame. If the transport queue is empty it keeps refining at up to the configured frame rate, using a VBV buffer twice the motion size at the current target bitrate. Forced IDR frames at session start and recovery use that same larger buffer. Refinement stops when:
 
@@ -91,7 +126,7 @@ Quality recovery: when the picture is unchanged for 150 ms, the capture worker r
 
 The worker restores the motion VBV before encoding the next changed frame. Refinement starts only when no frames are in flight, although an already published refinement frame can delay later damage.
 
-Failure handling: a capture or encode failure keeps pending work and forces an IDR in the same generation. The first two consecutive failures reopen the encoder after 1 s. The third, or a failed reopen, is fatal and the server exits.
+Failure handling: an encoder failure follows the state machine in [Encoder](#encoder). A capture failure keeps pending work and retries with an IDR after 1 s. The third consecutive capture failure is fatal and the server exits.
 
 Color: little-endian BGRA and big-endian ARGB convert to NV12 with limited-range BT.709 in `src/engine/core/color.cpp` (NEON on AArch64, SSE2 on x86, scalar elsewhere), with chroma signaled as center-sited.
 
@@ -138,22 +173,28 @@ A global install is a copy of the package, so repeat these steps after each chan
 
 ## Build and test
 
-The engine is C++17. Its shared pkg-config dependencies are `x264`, `libwebsockets` with TLS, and `zlib`. X11 adds `x11`, `xext`, `xdamage`, `xfixes`, and `xtst`; Wayland adds `wayland-client`, `xkbcommon`, and `wayland-scanner`. The engine does not link FFmpeg. `screen-relay install --backend` selects the compiled backends and installs matching packages; it accepts `x11`, `wayland`, or `all` and defaults to `x11`. `screen-relay install` and `screen-relay doctor` read the package names for each family from `packages.tsv`.
+The engine is C++17. Its required pkg-config dependencies are `x264`, `libwebsockets` with TLS, and `zlib`. When `libavcodec` and `libavutil` are also present, `make` builds the libavcodec hardware encoders behind `-DRELAY_HWENC`; `make HWENC=0` turns that off. `make RTC=1` adds the WebRTC viewer and needs `libdatachannel`. X11 adds `x11`, `xext`, `xdamage`, `xfixes`, and `xtst`; Wayland adds `wayland-client`, `xkbcommon`, and `wayland-scanner`. `screen-relay install --backend` selects the compiled backends and installs matching packages; it accepts `x11`, `wayland`, or `all` and defaults to `x11`. `screen-relay install` and `screen-relay doctor` read the package names for each family from `packages.tsv`.
 
 ```sh
 make                 # builds relay-engine
 npm ci && npm run build   # dist/cli/relay.mjs, dist/sdk/, dist/viewer/ (Node 22 or newer)
-make test            # native unit tests: color, flow, input, server, backend
+make test            # native unit tests: color, flow, input, encoder state, stream hub, server, backend
 npm test             # TypeScript unit tests
 ```
+
+`make test-encoder-state` checks the encoder state machine and `make test-stream-hub` checks the shared pipeline and subscriber flow.
+
+`make RTC=1` defines `-DRELAY_RTC` and links `libdatachannel`, using its pkg-config file or a Homebrew install under `/opt/homebrew`. Without it, `GET /rtc/config` reports `enabled: false` and the viewer stays on the WebSocket stream. With it, `#transport=auto`, the default, starts on the WebSocket stream and upgrades to WebRTC in the background once ICE succeeds. `#transport=rtc` adds a WebSocket fallback, `#transport=rtc-only` drops it, and `#transport=ws` skips WebRTC.
 
 On Windows, build with [MSYS2](https://www.msys2.org/) in the UCRT64 environment, where `make` selects the `windows` backend:
 
 ```sh
 pacman -S make diffutils mingw-w64-ucrt-x86_64-{gcc,pkgconf,libwebsockets,x264,ffmpeg}
 make                 # builds relay-engine.exe
-make test            # native unit tests: color, flow, input, server, backend
+make test            # native unit tests: color, flow, input, encoder state, stream hub, server, backend
 ```
+
+The `ffmpeg` package also provides the `libavcodec` and `libavutil` development files, so the Windows build includes `h264_nvenc`, `h264_qsv`, and `h264_amf`.
 
 Desktop Duplication works only in the signed-in user's desktop session. Start `relay-engine.exe` from that session, not from an SSH or service session.
 
@@ -164,6 +205,8 @@ brew install pkgconf x264 libwebsockets ffmpeg
 make                 # builds relay-engine with the macos backend
 make test
 ```
+
+VideoToolbox comes from the system SDK, so the macOS hardware encoder needs no extra package. For `make RTC=1`, `brew install libdatachannel` provides the library.
 
 ffmpeg is only needed for `make test-backend`.
 

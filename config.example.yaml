@@ -8,7 +8,7 @@ display:
   compositor: auto
 
 stream:
-  # 10..120.
+  # 10..240.
   fps: 60
   # Bits per second, 250000..100000000. A k or M suffix is 1000-based.
   # Require min <= start <= max.
@@ -16,6 +16,8 @@ stream:
     min: 1M
     start: 8M
     max: 40M
+  # auto, x264, or a platform encoder name (for example h264_videotoolbox, h264_nvenc, h264_vaapi).
+  encoder: auto
 
 server:
   # 1..65535.
@@ -23,6 +25,10 @@ server:
   # bind: 127.0.0.1
   # public: https://desktop.example.com
   # allow_origin: https://app.example.com,http://localhost:8081
+  # Up to 8 stun:, turn:, or turns: URLs for WebRTC viewers.
+  # ice_servers:
+  #   - stun:stun.example.com:3478
+  #   - turn:user:pass@relay.example.com:3478?transport=tcp
   # tls_cert: /path/fullchain.pem
   # tls_key: /path/key.pem
 

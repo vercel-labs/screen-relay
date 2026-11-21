@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -9,7 +9,7 @@ import { clientFailure, cmdRemoteStatus } from '../client.js';
 import { applyTo, loadConfig } from '../config.js';
 import { emit, Failure, formatReady, formatStarted, formatStatus, formatStopped, nextStep, printNext, printWarning, sessionCommand } from '../output.js';
 import { COMPONENTS, HostArgs, requireHost, spawnCleared, which } from './common.js';
-import { alive, cleanupWaylandRuntime, lock, readSession, reap, stateDir, tail, writeSession } from './state.js';
+import { alive, cleanupWaylandRuntime, lock, readSession, reap, stateDir, tail, writePrivateFile, writeSession } from './state.js';
 import { ensureSetup } from './setup.js';
 import { attaches, connectHost, desktopEnv, Session } from './supervisor.js';
 import { startWatcher } from './watcher.js';
@@ -22,6 +22,28 @@ type Args = HostArgs & Record<string, any>;
 async function reapSession(directory: string, session: Record<string, any> | null, signal?: AbortSignal): Promise<boolean> {
   await reap(directory, session, signal);
   return cleanupWaylandRuntime(session);
+}
+
+/** Removes sensitive --ice-server flags from a detached supervisor's argv and returns the environment it starts with. */
+export function detachedSupervisorSpawn(argv: string[], env: NodeJS.ProcessEnv, iceServersFile?: string): { args: string[]; env: NodeJS.ProcessEnv } {
+  const args: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const token = argv[index];
+    if (token === '--') {
+      args.push(...argv.slice(index));
+      break;
+    }
+    if (token === '--ice-server') {
+      if (index + 1 < argv.length) index++;
+      continue;
+    }
+    if (token.startsWith('--ice-server=')) continue;
+    args.push(token);
+  }
+  const childEnv: NodeJS.ProcessEnv = { ...env, SCREEN_RELAY_READY_FD: '3' };
+  delete childEnv.SCREEN_RELAY_ICE_SERVERS;
+  if (iceServersFile) childEnv.SCREEN_RELAY_ICE_SERVERS_FILE = iceServersFile;
+  return { args, env: childEnv };
 }
 
 export async function cmdUp(args: Args): Promise<number> {
@@ -37,6 +59,7 @@ export async function cmdUp(args: Args): Promise<number> {
       : 'display.resolution is ignored with --display; the existing display size is used' }] : [];
   for (const warning of warnings) printWarning(warning.message, args);
   applyTo(args, settings, present);
+  delete process.env.SCREEN_RELAY_ICE_SERVERS;
   const port = Number(args.port ?? 8080);
   const timeout = Number(args.timeout ?? 30);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Failure('invalid_input', 'Port must be between 1 and 65535', 'Run `screen-relay up --help`.');
@@ -49,6 +72,8 @@ export async function cmdUp(args: Args): Promise<number> {
   chmodSync(directory, 0o700);
   const readyFd = Number(process.env.SCREEN_RELAY_READY_FD ?? -1);
   delete process.env.SCREEN_RELAY_READY_FD;
+  const preparedIceServersFile = process.env.SCREEN_RELAY_ICE_SERVERS_FILE;
+  delete process.env.SCREEN_RELAY_ICE_SERVERS_FILE;
   const chosen = readyFd < 0 ? await ensureSetup(args) : [];
   if (args.detach && readyFd < 0) return detach(args, directory, timeout, warnings, chosen);
   let pipeFd = readyFd;
@@ -69,6 +94,7 @@ export async function cmdUp(args: Args): Promise<number> {
       throw error;
     }
     await reapSession(directory, readSession(args.name));
+    if (preparedIceServersFile) args['ice-servers-file'] = preparedIceServersFile;
     session = new Session({
       ...args,
       port,
@@ -109,8 +135,13 @@ async function detach(args: Args, directory: string, timeout: number, warnings: 
   await probe.close();
   const logPath = join(directory, 'supervisor.log');
   const log = openSync(logPath, 'w', 0o600);
-  const child = spawn(process.execPath, [process.argv[1] ?? '', ...process.argv.slice(2), ...chosen], {
-    cwd: process.cwd(), env: { ...process.env, SCREEN_RELAY_READY_FD: '3' }, detached: true, windowsHide: true,
+  const iceServers: string[] = Array.isArray(args['ice-server']) ? args['ice-server'] : [];
+  const iceServersFile = join(directory, 'ice-servers');
+  if (iceServers.length) writePrivateFile(iceServersFile, `${iceServers.join('\n')}\n`);
+  else rmSync(iceServersFile, { force: true });
+  const detached = detachedSupervisorSpawn(process.argv.slice(2), process.env, iceServers.length ? iceServersFile : undefined);
+  const child = spawn(process.execPath, [process.argv[1] ?? '', ...detached.args, ...chosen], {
+    cwd: process.cwd(), env: detached.env, detached: true, windowsHide: true,
     stdio: ['ignore', log, log, 'pipe'],
   });
   const signal = args.signal as AbortSignal | undefined;
@@ -188,6 +219,7 @@ export async function cmdDown(args: Args): Promise<number> {
       } finally { await held.close(); }
     }
   }
+  try { rmSync(join(directory, 'ice-servers'), { force: true }); } catch {}
   args.signal?.throwIfAborted();
   emit(args, { session: { name: args.name, state: 'stopped' }, outcome: running ? 'stopped' : 'unchanged' },
     formatStopped(args.name, running, args) + '\n' + nextStep('Start it', sessionCommand('up -d', args.name), args), {});

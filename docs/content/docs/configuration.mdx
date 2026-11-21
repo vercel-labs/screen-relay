@@ -38,8 +38,10 @@ display:
   resolution: 1280x720
 
 stream:
-  # 10..120.
+  # 10..240.
   fps: 60
+  # auto, x264, or a hardware encoder name.
+  encoder: auto
   # Bits per second, 250000..100000000. A k or M suffix is 1000-based.
   # Require min <= start <= max.
   bitrate:
@@ -55,6 +57,9 @@ server:
   # allow_origin: https://app.example.com,http://localhost:8081
   # tls_cert: /path/fullchain.pem
   # tls_key: /path/key.pem
+  # ice_servers:
+  #   - stun:stun.example.com
+  #   - turn:user:pass@turn.example.com:3478?transport=udp
 
 keyboard:
   # Layout name such as us, de or fr, or a comma-separated list. Linux only.
@@ -80,7 +85,8 @@ nano ~/.config/screen-relay/config.yaml
 | --- | --- | --- | --- | --- |
 | `display.resolution` | `1280x720` | The desktop size as `WIDTHxHEIGHT`, both even. Width 320 to 16384, height 240 to 16384. Ignored with `--display` and on macOS and Windows, which use the existing screen's size. | None | `SCREEN_RELAY_RESOLUTION` |
 | `display.compositor` | `auto` | `auto`, `on`, or `off`. Whether the XFCE desktop that screen-relay starts runs its compositor, which draws window shadows and transparency and repaints at most 60 times a second. `auto` turns it off when `stream.fps` is above 60. Ignored with `--display` and for any other desktop. | None | `SCREEN_RELAY_COMPOSITOR` |
-| `stream.fps` | `60` | Whole number from 10 to 120 | None | `SCREEN_RELAY_FPS` |
+| `stream.fps` | `60` | Whole number from 10 to 240 | None | `SCREEN_RELAY_FPS` |
+| `stream.encoder` | `auto` | `auto` probes for a hardware encoder, keeps it while it holds the frame budget set by `stream.fps`, and adapts back to `x264` when it fails or falls behind. `x264` uses software encoding only. Any other name (such as `h264_videotoolbox` on macOS, or `h264_nvenc`, `h264_qsv`, `h264_amf`, and `h264_vaapi` elsewhere) pins that encoder and falls back to `x264` only when it errors. Use letters, digits, and `_`. | `--encoder` | `SCREEN_RELAY_ENCODER` |
 | `stream.bitrate.min` | `1M` | 250000 to 100000000, as a whole number or with a `k` (thousand) or `M` (million) suffix. No higher than `start`. | None | `SCREEN_RELAY_BITRATE_MIN` |
 | `stream.bitrate.start` | `8M` | Same values as `min`. The stream adjusts between `min` and `max` from here. | None | `SCREEN_RELAY_BITRATE_START` |
 | `stream.bitrate.max` | `40M` | Same values as `min`. No lower than `start`. | None | `SCREEN_RELAY_BITRATE_MAX` |
@@ -90,6 +96,7 @@ nano ~/.config/screen-relay/config.yaml
 | `server.allow_origin` | unset | Up to 16 comma-separated origins, as in [`--allow-origin`](/docs/remote-access#browser-origins): lowercase HTTPS origins for any host, or loopback HTTP origins such as `http://localhost:8081`. Requires a token. | `--allow-origin` | `SCREEN_RELAY_ALLOW_ORIGIN` |
 | `server.tls_cert` | unset | Path to a certificate file. Set with `tls_key`. | `--tls-cert` | `SCREEN_RELAY_TLS_CERT` |
 | `server.tls_key` | unset | Path to the private key file. Set with `tls_cert`. | `--tls-key` | `SCREEN_RELAY_TLS_KEY` |
+| `server.ice_servers` | unset | Up to 8 STUN, TURN, or TURNS server URLs for WebRTC viewers, as a YAML list. For example `stun:stun.example.com` or `turn:user:pass@turn.example.com:3478?transport=udp`. | `--ice-server`, repeated up to 8 times | `SCREEN_RELAY_ICE_SERVERS`, whitespace-separated |
 | `keyboard.layout` | `us` | A layout name such as `de` or `fr`, or a comma-separated list such as `us,de`, using letters, digits, `_`, and `-`. On X11 it needs `setxkbmap`, which `screen-relay doctor` checks. | None | `SCREEN_RELAY_KEYBOARD_LAYOUT` |
 | `backend` | `x11` when the engine includes it, else `wayland`; `macos` on macOS; `windows` on Windows | `x11`, `wayland`, `macos`, or `windows`. See [X11](/docs/linux), [Wayland](/docs/linux), [macOS](/docs/macos), and [Windows](/docs/windows). | `--backend` | `SCREEN_RELAY_BACKEND` |
 | `desktop` | `xfce` on X11, `foot` on Wayland, or `none` with `--display`. Ignored on macOS and Windows, which start no desktop. | `xfce`, `none`, or a command. See [X11](/docs/linux) and [Wayland](/docs/linux). | `--desktop` | `SCREEN_RELAY_DESKTOP` |

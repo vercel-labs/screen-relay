@@ -10,8 +10,8 @@ export const COMPOSITORS = ['auto', 'on', 'off'] as const;
 
 export type ConfigSettings = {
   display: { resolution: string; compositor: (typeof COMPOSITORS)[number] };
-  stream: { fps: number; bitrate: { min: number; start: number; max: number } };
-  server: { port: number; bind: string; public: string | null; allow_origin: string | null; tls_cert: string | null; tls_key: string | null };
+  stream: { fps: number; bitrate: { min: number; start: number; max: number }; encoder: string };
+  server: { port: number; bind: string; public: string | null; allow_origin: string | null; tls_cert: string | null; tls_key: string | null; ice_servers: string[] | null };
   keyboard: { layout: string };
   desktop: string;
   backend?: string;
@@ -22,8 +22,8 @@ type ConfigSection = 'display' | 'stream' | 'server' | 'keyboard';
 
 const SECTIONS: Record<ConfigSection, readonly string[]> = {
   display: ['resolution', 'compositor'],
-  stream: ['fps', 'bitrate'],
-  server: ['port', 'bind', 'public', 'allow_origin', 'tls_cert', 'tls_key'],
+  stream: ['fps', 'bitrate', 'encoder'],
+  server: ['port', 'bind', 'public', 'allow_origin', 'tls_cert', 'tls_key', 'ice_servers'],
   keyboard: ['layout'],
 };
 const ROOT_KEYS = ['display', 'stream', 'server', 'keyboard', 'desktop', 'backend'];
@@ -80,12 +80,13 @@ function readConfig(source: string): Mapping {
   try {
     const document = parseDocument(text, { intAsBigInt: true });
     if (document.errors.length) {
-      throw new Failure('invalid_input', document.errors.map((error) => error.message).join('\n'), 'Fix the YAML syntax.');
+      const summaries = document.errors.map((error) => error.message.split('\n')[0] ?? 'YAML syntax error');
+      throw new Failure('invalid_input', summaries.join('\n'), 'Fix the YAML syntax.');
     }
     data = document.toJS();
   } catch (error) {
     if (error instanceof Failure) throw error;
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = (error instanceof Error ? error.message : String(error)).split('\n')[0] ?? 'YAML syntax error';
     throw new Failure('invalid_input', `Cannot parse config file ${source}: ${detail}`, 'Fix the YAML syntax.');
   }
   if (data === null) return {};
@@ -104,6 +105,10 @@ function checkKeys(data: Mapping, allowed: readonly string[], prefix: string, er
 
 function wrong(path: string, value: unknown, expected: string): never {
   throw new Failure('invalid_input', `Invalid config value for ${path}: ${valueRepr(value)}; expected ${expected}`);
+}
+
+function wrongSensitive(path: string, expected: string): never {
+  throw new Failure('invalid_input', `Invalid config value for ${path}; expected ${expected}`);
 }
 
 function outOfRange(path: string, value: unknown, low: number, high: number): never {
@@ -138,6 +143,111 @@ export function allowedOrigins(value: unknown): boolean {
     const local = LOOPBACK_HTTP_ORIGIN.exec(origin);
     return local !== null && portAllowed(local[2], 80);
   });
+}
+
+/** Reports whether a value is an encoder name: letters, digits and underscores, and never empty. */
+export function encoderName(value: string): boolean {
+  return /^[A-Za-z0-9_]+$/.test(value);
+}
+
+const ICE_SCHEMES = ['stun:', 'turn:', 'turns:'] as const;
+const MAX_ICE_SERVERS = 8;
+export const MAX_ICE_SERVERS_BYTES = 16384;
+
+function iceHostname(host: string): boolean {
+  if (!host || host.startsWith('.') || host.endsWith('.') || host.startsWith('-') || host.endsWith('-')) return false;
+  return host.split('.').every((label) => label !== '' && !label.startsWith('-') && !label.endsWith('-') && /^[A-Za-z0-9-]+$/.test(label));
+}
+
+function iceIpv6(host: string): boolean {
+  return host !== '' && host.includes(':') && !host.startsWith('.') && !host.endsWith('.') && !host.includes('..') && /^[0-9A-Fa-f:.]+$/.test(host);
+}
+
+function icePort(text: string): boolean {
+  return /^[1-9][0-9]{0,4}$/.test(text) && Number(text) <= 65535;
+}
+
+/** Reports whether a TURN or TURNS server URL carries embedded userinfo credentials. */
+export function iceServerHasCredentials(spec: string): boolean {
+  const scheme = ICE_SCHEMES.find((candidate) => spec.startsWith(candidate));
+  if (!scheme || scheme === 'stun:') return false;
+  const authority = spec.slice(scheme.length);
+  const query = authority.indexOf('?');
+  const hostPart = query >= 0 ? authority.slice(0, query) : authority;
+  return hostPart.includes('@');
+}
+
+/** Reports whether a value is a STUN or TURN server URL in the form the engine accepts. */
+export function iceServerSpec(spec: string): boolean {
+  if (!spec) return false;
+  for (const character of spec) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code <= 0x20 || code === 0x7f) return false;
+  }
+  if (spec.includes('#') || spec.includes('/')) return false;
+  const scheme = ICE_SCHEMES.find((candidate) => spec.startsWith(candidate));
+  if (!scheme) return false;
+  let authority = spec.slice(scheme.length);
+  if (!authority) return false;
+  const secure = scheme !== 'stun:';
+  if (secure) {
+    const at = authority.indexOf('@');
+    if (at >= 0) {
+      const userinfo = authority.slice(0, at);
+      const colon = userinfo.indexOf(':');
+      if (!userinfo || colon <= 0 || colon === userinfo.length - 1 || userinfo.indexOf(':', colon + 1) >= 0 || /[@?]/.test(userinfo)) return false;
+      authority = authority.slice(at + 1);
+      if (!authority) return false;
+    }
+  } else if (authority.includes('@')) return false;
+  const query = authority.indexOf('?');
+  if (query >= 0) {
+    if (!secure) return false;
+    const transport = authority.slice(query);
+    if (transport !== '?transport=udp' && transport !== '?transport=tcp') return false;
+    authority = authority.slice(0, query);
+  }
+  if (!authority) return false;
+  let host = '';
+  let port = '';
+  if (authority.startsWith('[')) {
+    const close = authority.indexOf(']');
+    if (close < 0 || close === 1) return false;
+    host = authority.slice(1, close);
+    if (!iceIpv6(host)) return false;
+    if (close + 1 < authority.length) {
+      if (authority[close + 1] !== ':') return false;
+      port = authority.slice(close + 2);
+      if (!port) return false;
+    }
+  } else {
+    const colon = authority.indexOf(':');
+    if (colon >= 0) {
+      if (authority.indexOf(':', colon + 1) >= 0) return false;
+      host = authority.slice(0, colon);
+      port = authority.slice(colon + 1);
+      if (!port) return false;
+    } else host = authority;
+    if (!iceHostname(host)) return false;
+  }
+  return host !== '' && (!port || icePort(port));
+}
+
+/** Reads up to eight ICE server URLs (at most 16 KiB serialized) from a YAML list, collected flags, or a whitespace-separated environment value. */
+export function iceServersList(value: unknown, path: string, allowString = true): string[] {
+  const entries: unknown[] = allowString && typeof value === 'string'
+    ? value.split(/\s+/).filter(Boolean)
+    : Array.isArray(value) ? value : wrongSensitive(path, 'a list of STUN or TURN server URLs');
+  if (entries.length > MAX_ICE_SERVERS) wrongSensitive(path, `at most ${MAX_ICE_SERVERS} STUN or TURN server URLs`);
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (typeof entry !== 'string' || !iceServerSpec(entry)) wrongSensitive(`${path}[${index}]`, 'a STUN or TURN URL such as stun:stun.example.com or turn:user:pass@turn.example.com:3478?transport=udp');
+  }
+  const list = entries as string[];
+  if (list.length && Buffer.byteLength(`${list.join('\n')}\n`, 'utf8') > MAX_ICE_SERVERS_BYTES) {
+    wrongSensitive(path, `at most ${MAX_ICE_SERVERS_BYTES} bytes of STUN or TURN server URLs`);
+  }
+  return list;
 }
 
 export function backendValue(value: unknown, path: string): (typeof BACKENDS)[number] {
@@ -219,7 +329,12 @@ type Validator = (value: unknown, path: string) => unknown;
 const validators = {
   'display.resolution': resolution,
   'display.compositor': compositorValue,
-  'stream.fps': (value, path) => integer(value, path, 10, 120),
+  'stream.fps': (value, path) => integer(value, path, 10, 240),
+  'stream.encoder': (value, path) => {
+    const name = textValue(value, path);
+    if (!encoderName(name)) wrong(path, value, 'auto, x264, or a name of letters, digits and underscores');
+    return name;
+  },
   'server.port': (value, path) => integer(value, path, 1, 65535),
   'server.bind': textValue,
   'server.public': (value: unknown, path: string) => {
@@ -234,6 +349,7 @@ const validators = {
   },
   'server.tls_cert': textValue,
   'server.tls_key': textValue,
+  'server.ice_servers': iceServersList,
   'keyboard.layout': (value: unknown, path: string) => {
     const layout = textValue(value, path);
     if (!/^[A-Za-z0-9_,-]+$/.test(layout)) {
@@ -248,12 +364,14 @@ const assign: Record<string, (settings: ConfigSettings, value: unknown, path: st
   'display.resolution': (settings, value, path) => { settings.display.resolution = validators['display.resolution'](value, path); },
   'display.compositor': (settings, value, path) => { settings.display.compositor = validators['display.compositor'](value, path); },
   'stream.fps': (settings, value, path) => { settings.stream.fps = validators['stream.fps'](value, path); },
+  'stream.encoder': (settings, value, path) => { settings.stream.encoder = validators['stream.encoder'](value, path) as string; },
   'server.port': (settings, value, path) => { settings.server.port = validators['server.port'](value, path); },
   'server.bind': (settings, value, path) => { settings.server.bind = validators['server.bind'](value, path); },
   'server.public': (settings, value, path) => { settings.server.public = validators['server.public'](value, path); },
   'server.allow_origin': (settings, value, path) => { settings.server.allow_origin = validators['server.allow_origin'](value, path); },
   'server.tls_cert': (settings, value, path) => { settings.server.tls_cert = validators['server.tls_cert'](value, path); },
   'server.tls_key': (settings, value, path) => { settings.server.tls_key = validators['server.tls_key'](value, path); },
+  'server.ice_servers': (settings, value, path) => { settings.server.ice_servers = iceServersList(value, path, false); },
   'keyboard.layout': (settings, value, path) => { settings.keyboard.layout = validators['keyboard.layout'](value, path); },
 };
 
@@ -262,8 +380,8 @@ export function loadConfig(path?: string): [ConfigSettings, string | null, Set<s
   let loadedSource = source;
   const settings: ConfigSettings = {
     display: { resolution: '1280x720', compositor: 'auto' },
-    stream: { fps: 60, bitrate: { min: 1000000, start: 8000000, max: 40000000 } },
-    server: { port: 8080, bind: '127.0.0.1', public: null, allow_origin: null, tls_cert: null, tls_key: null },
+    stream: { fps: 60, bitrate: { min: 1000000, start: 8000000, max: 40000000 }, encoder: 'auto' },
+    server: { port: 8080, bind: '127.0.0.1', public: null, allow_origin: null, tls_cert: null, tls_key: null, ice_servers: null },
     keyboard: { layout: 'us' },
     desktop: 'xfce',
   };
@@ -321,6 +439,8 @@ export function applyTo(args: Record<string, unknown>, settings: ConfigSettings,
     ['resolution', 'SCREEN_RELAY_RESOLUTION', 'display.resolution', settings.display.resolution],
     ['compositor', 'SCREEN_RELAY_COMPOSITOR', 'display.compositor', settings.display.compositor],
     ['fps', 'SCREEN_RELAY_FPS', 'stream.fps', settings.stream.fps],
+    ['encoder', 'SCREEN_RELAY_ENCODER', 'stream.encoder', settings.stream.encoder],
+    ['ice-server', 'SCREEN_RELAY_ICE_SERVERS', 'server.ice_servers', present.has('server.ice_servers') ? settings.server.ice_servers : undefined],
     ['bitrateMin', 'SCREEN_RELAY_BITRATE_MIN', 'stream.bitrate.min', settings.stream.bitrate.min],
     ['bitrateStart', 'SCREEN_RELAY_BITRATE_START', 'stream.bitrate.start', settings.stream.bitrate.start],
     ['bitrateMax', 'SCREEN_RELAY_BITRATE_MAX', 'stream.bitrate.max', settings.stream.bitrate.max],
@@ -330,8 +450,9 @@ export function applyTo(args: Record<string, unknown>, settings: ConfigSettings,
   const errors: Failure[] = [];
   for (const [key, environment, path, fallback] of fields) {
     const explicit = args[key] !== undefined;
-    const fromEnvironment = !explicit && process.env[environment] !== undefined;
-    const value = explicit ? args[key] : fromEnvironment ? process.env[environment] : fallback;
+    const rawEnv = process.env[environment];
+    const fromEnvironment = !explicit && rawEnv !== undefined && !(key === 'ice-server' && !rawEnv.trim());
+    const value = explicit ? args[key] : fromEnvironment ? rawEnv : fallback;
     if (!explicit && !fromEnvironment) {
       resolved[key] = value;
       continue;

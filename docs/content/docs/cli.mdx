@@ -31,14 +31,16 @@ screen-relay up -d --name demo --port 8084
 | `--display DISPLAY` | Attach to an existing display at its size: `:0` (X display) or `wayland-1` (Wayland socket) on Linux. Not supported on macOS or Windows. |
 | `--backend x11\|wayland\|macos\|windows` | On Linux, default `x11` when available, else `wayland`. Without a configured backend, a display without a colon selects Wayland. On macOS, `macos`. On Windows, `windows`. |
 | `--output NAME` | Wayland output name, a macOS display ID, or a Windows display name such as `'\\.\DISPLAY2'`. Default: first output, the main display on macOS, or the primary display on Windows. Not valid on X11. |
+| `--encoder ENCODER` | `auto` probes for a hardware encoder and uses it while it keeps up with the target frame budget, then adapts back to `x264` when the hardware fails or falls behind. `x264` uses software encoding only. Any other name (such as `h264_videotoolbox` on macOS) pins that encoder and falls back to `x264` only when it errors. Default `auto`. Env: `SCREEN_RELAY_ENCODER`. |
 | `--public URL` | HTTPS origin. Does not change the listen address. Generates a token. Requires a TLS proxy unless direct TLS is configured. |
 | `--allow-origin ORIGINS` | Comma-separated exact origins for browser WebSocket connections, in addition to the `--public` origin or loopback. This does not enable cross-origin browser HTTP access. Use lowercase `https://HOST[:PORT]` for any host, or `http://localhost[:PORT]` and `http://127.0.0.1[:PORT]` for a page served on the machine itself. No wildcards. Generates a token. Env: `SCREEN_RELAY_ALLOW_ORIGIN`. See [Browser origins](/docs/remote-access#browser-origins). |
+| `--ice-server URL` | Add a credential-free STUN, TURN, or TURNS server for WebRTC viewers, such as `stun:stun.example.com`. Repeat up to 8 times. Put credential-bearing TURN URLs in `server.ice_servers` in `config.yaml` or `SCREEN_RELAY_ICE_SERVERS`, whitespace-separated. |
 | `--tls-cert FILE`, `--tls-key FILE` | Serve TLS directly. Both are required. |
 | `--bind ADDR` | Listen address. Defaults to `127.0.0.1`, including with `--public`. Any other address generates a token. |
 | `--timeout S` | Engine and desktop readiness timeout in seconds. Default `30`; must be positive. |
 | `--yes`, `-y` | Install missing packages without asking. Required when there is no terminal. |
 
-- Default display: 1280x720 at 60 fps.
+- Default display: 1280x720 at 60 fps. `stream.fps` accepts 10 to 240.
 - On macOS, screen-relay attaches to the existing display and ignores `display.resolution`. It does not stop an attached display.
 - On Windows, screen-relay attaches to the signed-in user's desktop and ignores `display.resolution` with a warning. Run `up` in a terminal on that desktop. Over SSH or from a service session, `up` fails. The viewer link always carries a token.
 - To become ready, a desktop command must open a window on X11 or a new Wayland display. Startup failures include the component's log.
@@ -466,6 +468,7 @@ Options override environment variables, then config values, then defaults. Inval
 | --- | --- |
 | `SCREEN_RELAY_CONFIG` | Config file for `up`, `install`, and `doctor`. |
 | `SCREEN_RELAY_PORT`, `SCREEN_RELAY_BIND`, `SCREEN_RELAY_PUBLIC`, `SCREEN_RELAY_TLS_CERT`, `SCREEN_RELAY_TLS_KEY`, `SCREEN_RELAY_DESKTOP`, `SCREEN_RELAY_BACKEND` | Matching `up` options; `SCREEN_RELAY_BACKEND` also selects the backend for `doctor` and `install`. |
+| `SCREEN_RELAY_ENCODER`, `SCREEN_RELAY_ICE_SERVERS` | Matching `up` options. Separate ICE servers with whitespace. |
 | `SCREEN_RELAY_RESOLUTION`, `SCREEN_RELAY_COMPOSITOR`, `SCREEN_RELAY_FPS`, `SCREEN_RELAY_BITRATE_MIN`, `SCREEN_RELAY_BITRATE_START`, `SCREEN_RELAY_BITRATE_MAX`, `SCREEN_RELAY_KEYBOARD_LAYOUT` | Display, stream, and keyboard settings. |
 | `SCREEN_RELAY_URL`, `SCREEN_RELAY_TOKEN_FILE` | Client URL and token file. |
 | `SCREEN_RELAY_AGENT` | Help layout: `1` for agent, `0` for human. |

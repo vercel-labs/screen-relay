@@ -102,11 +102,11 @@ test('validates server.allow_origin as exact HTTPS or loopback HTTP origins', ()
 
 test('validates the FPS range in YAML and keeps the default at 60', () => {
   assert.equal(config.loadConfig(write('{}\n'))[0].stream.fps, 60);
-  for (const fps of [10, 60, 61, 120]) {
+  for (const fps of [10, 60, 61, 240]) {
     assert.equal(config.loadConfig(write(`stream:\n  fps: ${fps}\n`))[0].stream.fps, fps);
   }
-  for (const fps of [9, 121]) {
-    assert.throws(() => config.loadConfig(write(`stream:\n  fps: ${fps}\n`)), /stream\.fps.*allowed 10\.\.120/);
+  for (const fps of [9, 241]) {
+    assert.throws(() => config.loadConfig(write(`stream:\n  fps: ${fps}\n`)), /stream\.fps.*allowed 10\.\.240/);
   }
 });
 
@@ -114,16 +114,17 @@ test('validates FPS overrides from arguments and SCREEN_RELAY_FPS', () => {
   const [settings, , present] = config.loadConfig(write('{}\n'));
   const previous = process.env.SCREEN_RELAY_FPS;
   try {
-    process.env.SCREEN_RELAY_FPS = '120';
+    process.env.SCREEN_RELAY_FPS = '240';
     const args = {};
     config.applyTo(args, settings, present);
-    assert.equal(args.fps, 120);
-    process.env.SCREEN_RELAY_FPS = '121';
-    assert.throws(() => config.applyTo({}, settings, present), /SCREEN_RELAY_FPS.*allowed 10\.\.120/);
-    const explicit = { fps: 120 };
+    assert.equal(args.fps, 240);
+    process.env.SCREEN_RELAY_FPS = '241';
+    assert.throws(() => config.applyTo({}, settings, present), /SCREEN_RELAY_FPS.*allowed 10\.\.240/);
+    const explicit = { fps: 240 };
     config.applyTo(explicit, settings, present);
-    assert.equal(explicit.fps, 120);
-    assert.throws(() => config.applyTo({ fps: 121 }, settings, present), /--fps.*allowed 10\.\.120/);
+    assert.equal(explicit.fps, 240);
+    assert.throws(() => config.applyTo({ fps: 241 }, settings, present), /--fps.*allowed 10\.\.240/);
+    assert.throws(() => config.applyTo({ fps: 9 }, settings, present), /--fps.*allowed 10\.\.240/);
   } finally {
     if (previous === undefined) delete process.env.SCREEN_RELAY_FPS;
     else process.env.SCREEN_RELAY_FPS = previous;
@@ -212,4 +213,94 @@ test('doctor reports an invalid SCREEN_RELAY_BACKEND as a failed check', { skip:
   const backend = checks.find((item) => item.name === 'backend');
   assert.equal(backend.status, 'fail');
   assert.match(backend.detail, /SCREEN_RELAY_BACKEND.*wayl.*x11 or wayland/);
+});
+
+test('loads the encoder and the ICE servers from YAML, defaulting to auto and none', () => {
+  const [empty] = config.loadConfig(write('{}\n'));
+  assert.equal(empty.stream.encoder, 'auto');
+  assert.equal(empty.server.ice_servers, null);
+  const servers = ['stun:stun.example.com', 'turns:user:pass@turn.example.com:5349?transport=tcp'];
+  const [settings, , present] = config.loadConfig(write(`stream:\n  encoder: x264\nserver:\n  ice_servers:\n    - ${servers[0]}\n    - ${servers[1]}\n`));
+  assert.equal(settings.stream.encoder, 'x264');
+  assert.deepEqual(settings.server.ice_servers, servers);
+  assert.ok(present.has('stream.encoder'));
+  assert.ok(present.has('server.ice_servers'));
+  const args = {};
+  config.applyTo(args, settings, present);
+  assert.equal(args.encoder, 'x264');
+  assert.deepEqual(args['ice-server'], servers);
+});
+
+test('accepts only encoder names of letters, digits and underscores', () => {
+  for (const value of ['auto', 'x264', 'h264_videotoolbox', 'H264']) assert.ok(config.encoderName(value), value);
+  for (const value of ['', 'x 264', 'x264!', 'x-264', 'x.264']) assert.equal(config.encoderName(value), false, value);
+  assert.throws(() => config.loadConfig(write('stream:\n  encoder: x-264\n')), /stream\.encoder/);
+  assert.throws(() => config.loadConfig(write('stream:\n  encoder: ""\n')), /stream\.encoder.*a non-empty string/);
+});
+
+test('accepts the STUN and TURN server URLs that the engine accepts', () => {
+  for (const value of ['stun:stun.example.com', 'stun:127.0.0.1:3478', 'stun:[::1]', 'stun:[2001:db8::1]:3478',
+    'turn:turn.example.com:3478', 'turn:user:pass@turn.example.com:3478?transport=udp', 'turns:user:pass@turn.example.com:5349?transport=tcp']) {
+    assert.equal(config.iceServerSpec(value), true, value);
+  }
+  for (const value of ['', 'stun:', 'STUN:stun.example.com', 'http:stun.example.com', 'stun:user@stun.example.com', 'stun:stun.example.com?transport=udp',
+    'stun:stun.example.com:0', 'stun:stun.example.com:08080', 'stun:stun.example.com:65536', 'stun:-stun.example.com',
+    'stun:stun.example.com.', 'stun:host/path', 'stun:host#fragment', 'stun:[]', 'stun:[::1]x', 'turn:user@turn.example.com',
+    'turn:user:pass@', 'turn:user:pass@turn.example.com:0', 'turn:user:pa:ss@turn.example.com', 'turn:@turn.example.com',
+    'turn:user:@turn.example.com', 'turn:turn.example.com?transport=sctp', 'turn:turn.example.com:3478?transport=tcp?x',
+    'turn:turn.example.com:3478?transport=TCP']) {
+    assert.equal(config.iceServerSpec(value), false, value);
+  }
+  assert.throws(() => config.loadConfig(write('server:\n  ice_servers:\n    - stun:user@stun.example.com\n')), /server\.ice_servers/);
+  assert.throws(() => config.loadConfig(write('server:\n  ice_servers:\n    url: stun:stun.example.com\n')), /server\.ice_servers.*a list/);
+  assert.throws(() => config.loadConfig(write('server:\n  ice_servers: stun:stun.example.com\n')), /server\.ice_servers.*a list/);
+  assert.throws(() => config.loadConfig(write('server:\n  ice_servers: [turn:u:s3cr3t-yaml-pass@turn.example.com\n')), (error) => !error.message.includes('s3cr3t-yaml-pass'));
+});
+
+test('the encoder and the ICE servers come from the environment, and flags win', () => {
+  const [settings, , present] = config.loadConfig(write('{}\n'));
+  const previous = { encoder: process.env.SCREEN_RELAY_ENCODER, servers: process.env.SCREEN_RELAY_ICE_SERVERS };
+  const servers = ['stun:stun.example.com', 'turn:user:pass@turn.example.com:3478?transport=tcp'];
+  try {
+    process.env.SCREEN_RELAY_ENCODER = 'x264';
+    process.env.SCREEN_RELAY_ICE_SERVERS = servers.join(' ');
+    const args = {};
+    config.applyTo(args, settings, present);
+    assert.equal(args.encoder, 'x264');
+    assert.deepEqual(args['ice-server'], servers);
+
+    const explicit = { encoder: 'h264_videotoolbox', 'ice-server': ['stun:flags.example.com'] };
+    config.applyTo(explicit, settings, present);
+    assert.equal(explicit.encoder, 'h264_videotoolbox');
+    assert.deepEqual(explicit['ice-server'], ['stun:flags.example.com']);
+
+    process.env.SCREEN_RELAY_ENCODER = 'x 264';
+    assert.throws(() => config.applyTo({}, settings, present), /SCREEN_RELAY_ENCODER/);
+    process.env.SCREEN_RELAY_ENCODER = 'x264';
+
+    process.env.SCREEN_RELAY_ICE_SERVERS = Array.from({ length: 8 }, (_, index) => `stun:h${index}.example.com`).join(' ');
+    const capped = {};
+    config.applyTo(capped, settings, present);
+    assert.equal(capped['ice-server'].length, 8);
+
+    process.env.SCREEN_RELAY_ICE_SERVERS = Array.from({ length: 9 }, (_, index) => `turn:u:s3cr3t-turn-pass@h${index}.example.com`).join(' ');
+    assert.throws(() => config.applyTo({}, settings, present), (error) => /SCREEN_RELAY_ICE_SERVERS.*at most 8/.test(error.message) && !error.message.includes('s3cr3t-turn-pass'));
+    process.env.SCREEN_RELAY_ICE_SERVERS = 'stun:ok.example.com turn:u:s3cr3t-turn-pass@bad.example.com/path';
+    assert.throws(() => config.applyTo({}, settings, present), (error) => /SCREEN_RELAY_ICE_SERVERS\[1\]/.test(error.message) && !error.message.includes('s3cr3t-turn-pass'));
+    assert.throws(() => config.loadConfig(write('server:\n  ice_servers:\n    - turn:u:s3cr3t-turn-pass@bad.example.com/path\n')), (error) => /server\.ice_servers\[0\]/.test(error.message) && !error.message.includes('s3cr3t-turn-pass'));
+    assert.throws(() => config.loadConfig(write(`server:\n  ice_servers:\n${Array.from({ length: 9 }, (_, index) => `    - turn:u:s3cr3t-turn-pass@h${index}.example.com\n`).join('')}`)), (error) => /server\.ice_servers.*at most 8/.test(error.message) && !error.message.includes('s3cr3t-turn-pass'));
+    assert.throws(() => config.applyTo({ 'ice-server': Array.from({ length: 9 }, (_, index) => `stun:h${index}.example.com`) }, settings, present), /at most 8 STUN or TURN server URLs/);
+    const [fromYaml, , yamlPresent] = config.loadConfig(write('server:\n  ice_servers:\n    - stun:config.example.com\n'));
+    process.env.SCREEN_RELAY_ICE_SERVERS = '';
+    const preserved = {};
+    config.applyTo(preserved, fromYaml, yamlPresent);
+    assert.deepEqual(preserved['ice-server'], ['stun:config.example.com']);
+    const oversized = Array.from({ length: 8 }, (_, index) => `turn:u:${'a'.repeat(2100)}@h${index}.example.com`);
+    assert.throws(() => config.applyTo({ 'ice-server': oversized }, settings, present), /at most 16384 bytes/);
+  } finally {
+    for (const [key, value] of Object.entries({ SCREEN_RELAY_ENCODER: previous.encoder, SCREEN_RELAY_ICE_SERVERS: previous.servers })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

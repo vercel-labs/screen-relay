@@ -13,8 +13,8 @@ screen-relay install [--backend x11|wayland|all|macos|windows] [--desktop xfce|n
          [--config FILE] [--yes]
 screen-relay up [-d] [--name NAME] [--config FILE] [--port PORT] [--desktop xfce|none|COMMAND]
          [--display DISPLAY] [--backend x11|wayland|macos|windows] [--output NAME|DISPLAY_ID]
-         [--public HTTPS_URL] [--allow-origin ORIGINS] [--tls-cert FILE --tls-key FILE]
-         [--bind ADDRESS] [--timeout SECONDS] [--yes]
+         [--encoder ENCODER] [--public HTTPS_URL] [--allow-origin ORIGINS] [--ice-server URL]...
+         [--tls-cert FILE --tls-key FILE] [--bind ADDRESS] [--timeout SECONDS] [--yes]
 screen-relay down [--name NAME]
 screen-relay logs [component] [--name NAME] [-f|--follow]
 screen-relay run -- <app> [args]... [--name NAME] [--restart]
@@ -27,14 +27,16 @@ screen-relay doctor [--config FILE]
   - `--config FILE`: read `backend` and `desktop` from this file.
   - `--yes`, `-y`: install packages without asking. Required when there is no terminal.
   - JSON outcome: `installed` or `unchanged`, with the backends and the engine path under `install`.
-- `up` starts a display (Xvfb on X11, or sway with XWayland on Wayland) or attaches to an existing one. On macOS it attaches to the logged-in user's display and starts no desktop. On Windows it attaches to the signed-in user's desktop and starts no virtual display or desktop. It then starts the desktop when enabled and the engine, waits until both are ready, and supervises the session. `--timeout` defaults to 30 seconds.
+- `up` starts a display (Xvfb on X11, or sway with XWayland on Wayland) or attaches to an existing one. On macOS it attaches to the logged-in user's display and starts no desktop. On Windows it attaches to the signed-in user's desktop and starts no virtual display or desktop. It then starts the desktop when enabled and the engine, waits until both are ready, and supervises the session. `--timeout` defaults to 30 seconds. The frame rate comes from `stream.fps`, 10 to 240, and defaults to 60.
   - Without `-d`, it runs in the foreground. The first Ctrl+C stops the session (exit 130). Piped, it prints only the viewer URL.
   - `--display DISPLAY`: attach to an X display (`:0`) or a Wayland socket (`wayland-1`). It keeps the caller's environment. A Wayland socket needs `XDG_RUNTIME_DIR`. macOS rejects it with `invalid_input`. Windows does not support it.
   - `--backend x11|wayland|macos|windows`: on Linux, defaults to `x11` when the engine has it, else `wayland`. A `--display` without a colon, such as `wayland-1`, selects `wayland` on its own. On macOS the only backend is `macos`, and on Windows it is `windows`. `x11` and `wayland` fail there with `invalid_input`, and `macos` fails on Linux the same way.
   - `--output NAME|DISPLAY_ID`: capture this Wayland output by name, a macOS display by its CGDirectDisplayID, or a Windows display such as `'\\.\DISPLAY2'`. `up` fails on x11.
+  - `--encoder ENCODER`: `auto` probes for a hardware encoder, keeps it while it holds the frame budget set by `stream.fps`, and adapts back to `x264` when it fails or falls behind; `x264` uses software encoding only; any other name pins that encoder and falls back to `x264` only when it errors. Env: `SCREEN_RELAY_ENCODER`.
   - `--yes`: when setup is needed, set it up without asking. Without a terminal, `up` never prompts and fails with `missing_input` unless `--yes` is given.
   - `--public HTTPS_URL`: advertises an HTTPS origin without changing the listen address. Expects a TLS proxy unless `--tls-cert` is set. Browser pages must be served from this origin, a loopback page connecting to the same address, or an origin in `--allow-origin`.
   - `--allow-origin ORIGINS`: comma-separated exact origins whose browser pages may also connect: lowercase `https://HOST[:PORT]` for any host, or `http://localhost[:PORT]` and `http://127.0.0.1[:PORT]` for a page served on the machine itself. No wildcards. Creates a token. Env: `SCREEN_RELAY_ALLOW_ORIGIN`.
+  - `--ice-server URL`: add a credential-free STUN, TURN, or TURNS server URL for WebRTC viewers; repeat up to 8 times. Set credential-bearing TURN URLs in `server.ice_servers` in `config.yaml` or `SCREEN_RELAY_ICE_SERVERS` (whitespace-separated).
   - `--bind ADDRESS`: listen address. Defaults to `127.0.0.1`, including with `--public`; another address generates a token.
   - Backend setup: [Wayland](wayland.md) and [macOS](macos.md).
 - `down` stops the session and everything it started. On Windows, apps started with `run` keep running. It is safe to repeat. JSON outcome: `stopped` or `unchanged`.

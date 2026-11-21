@@ -69,13 +69,15 @@ Coordinates are fractions from `0` to `1`, measured from the top-left. See [Inpu
 | `key(...combos)` | Press physical keys, such as `ctrl+l`; `cmd` and `meta` alias `super`. |
 | `type(text)` | Send one event per Unicode scalar using the remote keyboard layout. Empty text sends nothing. |
 | `input(events)` | Send a nonempty array of [input events](#input-events). |
-| `capabilities()` | Backend, screen size, `fps`, `max_input_batch`, and features. |
+| `capabilities()` | Backend, screen size, `fps`, `max_input_batch`, features, and the active `encoder`, `hardware_encoder`, and `encoder_state`. |
 | `status()` | Transport metrics; unavailable resource counters are `null`. |
 | `screenshot()` | PNG bytes, without the viewer's cursor overlay. |
 | `clipboard()` | The clipboard text, or an empty string when the clipboard holds no text. |
 | `setClipboard(text)` | Replace the clipboard text; an empty string clears it. Text is UTF-8, up to 256 KiB, without NUL characters. Returns no value. |
 
 `capabilities(options)`, `status(options)`, and `screenshot(options, path?)` are also standalone exports. `screenshot` returns PNG bytes and writes them to `path` when one is given.
+
+`capabilities` also includes `rtc`, which is `true` when the engine offers WebRTC; `ice_servers`, the number of configured STUN and TURN servers; and `transfer_tier`, which reports how frames reach the encoder (`zero_copy`, `dirty_upload`, `full_upload`, or `software`).
 
 Input batches:
 

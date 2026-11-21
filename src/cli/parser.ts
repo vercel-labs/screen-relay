@@ -22,8 +22,12 @@ export function unknownToken(kind: string, token: string, choices: string[], com
 
 function valueFor(parameter: Parameter, raw: unknown, command: string, fromEnvironment = false): unknown {
   const value = parameter.type === 'number' ? Number(raw) : raw;
-  if ((parameter.type === 'number' && (String(raw).trim() === '' || !Number.isFinite(value))) || (parameter.acceptedValues && !parameter.acceptedValues.includes(String(value))) || (parameter.validate && !parameter.validate(value))) {
-    throw usageFailure(`Invalid ${fromEnvironment ? parameter.environment : parameter.name}: '${String(raw)}'.${parameter.acceptedValues ? ` Expected ${parameter.acceptedValues.join(', ')}.` : ''}`, command);
+  const check = parameter.validate ? parameter.validate(value, fromEnvironment) : true;
+  if (check instanceof Failure) throw check;
+  if ((parameter.type === 'number' && (String(raw).trim() === '' || !Number.isFinite(value))) || (parameter.acceptedValues && !parameter.acceptedValues.includes(String(value))) || !check) {
+    const target = fromEnvironment ? parameter.environment : parameter.name;
+    const detail = parameter.sensitive ? `Invalid ${target}.` : `Invalid ${target}: '${String(raw)}'.`;
+    throw usageFailure(`${detail}${parameter.acceptedValues ? ` Expected ${parameter.acceptedValues.join(', ')}.` : ''}`, command);
   }
   return value;
 }
@@ -52,7 +56,11 @@ export function parseCommand(argv: string[], environment: NodeJS.ProcessEnv = pr
         raw = separator < 0 ? argv[++index] : token.slice(separator + 1);
         if (raw === undefined || (typeof raw === 'string' && raw.startsWith('-') && raw !== '-' && !/^-\d/.test(raw))) throw usageFailure(`Option '${flag}' requires ${option.valueHint ?? 'a value'}.`, name);
       }
-      values[option.name] = raw;
+      if (option.repeat === 'collect') {
+        const collected = values[option.name];
+        if (Array.isArray(collected)) collected.push(raw);
+        else values[option.name] = [raw];
+      } else values[option.name] = raw;
     } else if (!name) {
       if (!Object.hasOwn(commands, token)) throw unknownToken('command', token, Object.keys(commands));
       name = token;
@@ -76,8 +84,14 @@ export function parseCommand(argv: string[], environment: NodeJS.ProcessEnv = pr
   const early = command.validate?.(args);
   if (early instanceof Failure) throw early;
   for (const parameter of [...globalOptions, ...command.options, ...command.arguments]) {
-    const environmentValue = parameter.environment === 'SCREEN_RELAY_CONFIG' ? environment.SCREEN_RELAY_CONFIG || undefined : parameter.environment ? environment[parameter.environment] : undefined;
-    const raw = args[parameter.name] ?? environmentValue ?? (parameter.deferredDefault ? undefined : parameter.default);
+    const rawEnvironment = parameter.environment ? environment[parameter.environment] : undefined;
+    const environmentValue = parameter.environment === 'SCREEN_RELAY_CONFIG'
+      ? rawEnvironment || undefined
+      : parameter.repeat === 'collect' && rawEnvironment !== undefined && !rawEnvironment.trim()
+        ? undefined
+        : rawEnvironment;
+    let raw = args[parameter.name] ?? environmentValue ?? (parameter.deferredDefault ? undefined : parameter.default);
+    if (parameter.repeat === 'collect' && typeof raw === 'string') raw = raw.split(/\s+/).filter(Boolean);
     if (raw === undefined) {
       if (parameter.required) throw usageFailure(`Missing argument ${parameter.valueHint ?? parameter.name}.`, name, parameter.missingReason ?? 'missing_input');
       continue;

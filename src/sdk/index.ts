@@ -23,6 +23,7 @@ export interface Capabilities {
   screenshot: string; control: string; wayland: boolean; max_input_pending: number;
   input_endpoint: string; max_input_batch: number;
   cursor: boolean; audio: boolean; clipboard: boolean; resize: boolean; ime: boolean;
+  encoder?: string; hardware_encoder?: boolean; encoder_state?: string; rtc?: boolean; ice_servers?: number; transfer_tier?: string;
   clipboard_endpoint?: string; max_clipboard_bytes?: number;
 }
 /** Sends each call as its own request. Coordinates are fractions of the screen from 0 to 1, and `screenshot` resolves to PNG bytes. */

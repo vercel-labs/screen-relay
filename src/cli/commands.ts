@@ -1,5 +1,5 @@
 import { cmdClick, cmdClipboard, cmdInput, cmdKey, cmdMove, cmdScreenshot, cmdScroll, cmdType } from './client.js';
-import { BACKENDS, allowedOrigins } from './config.js';
+import { BACKENDS, allowedOrigins, encoderName, iceServerHasCredentials, iceServerSpec } from './config.js';
 import { cmdDoctor } from './host/doctor.js';
 import { cmdDown, cmdLogs, cmdRun, cmdStatus, cmdUp, COMPONENTS } from './host/session_commands.js';
 import { cmdInstall } from './host/setup.js';
@@ -21,7 +21,8 @@ export type Parameter = {
   missingReason?: string;
   environment?: string;
   deferredDefault?: boolean;
-  validate?: (value: unknown) => boolean;
+  sensitive?: boolean;
+  validate?: (value: unknown, fromEnvironment?: boolean) => boolean | Failure;
 };
 export type Subcommand = { name: string; summary: string; examples: { description: string; command: string }[]; resultSchema?: Record<string, unknown> };
 export type RunsOn = 'vm' | 'client' | 'anywhere';
@@ -74,8 +75,17 @@ export const commands: Record<string, Command> = {
       { name: 'display', type: 'string', valueHint: '<DISPLAY>', summary: 'Attach to an existing X display (:0) or Wayland socket (wayland-1) on Linux' },
       { name: 'backend', type: 'string', valueHint: '<BACKEND>', summary: 'On Linux, defaults to x11 when the engine has it, else wayland; a --display without a colon selects wayland. On macOS, defaults to macos; on Windows, defaults to windows', environment: 'SCREEN_RELAY_BACKEND', acceptedValues: BACKENDS },
       { name: 'output', type: 'string', valueHint: '<NAME>', summary: 'Capture a Wayland output by name, a macOS display by CGDirectDisplayID, or a Windows display by device name' },
+      { name: 'encoder', type: 'string', valueHint: '<ENCODER>', summary: 'Encode with auto, x264, or a hardware encoder name', environment: 'SCREEN_RELAY_ENCODER', default: 'auto', deferredDefault: true, validate: (value) => encoderName(String(value)) },
       { name: 'public', type: 'string', valueHint: '<URL>', summary: 'Advertise this HTTPS origin without changing the listen address', environment: 'SCREEN_RELAY_PUBLIC', validate: (value) => /^https:\/\/[^/?#@\\\s]+$/.test(String(value)) },
       { name: 'allow-origin', type: 'string', valueHint: '<ORIGINS>', summary: 'Also accept browser requests from these comma-separated exact origins: HTTPS for any host, or HTTP for localhost and 127.0.0.1', environment: 'SCREEN_RELAY_ALLOW_ORIGIN', validate: allowedOrigins },
+      { name: 'ice-server', type: 'string', valueHint: '<URL>', repeat: 'collect', sensitive: true, summary: 'Add a credential-free STUN or TURN server URL for WebRTC viewers; repeat up to 8 times (set credential-bearing TURN URLs in config.yaml or SCREEN_RELAY_ICE_SERVERS)', environment: 'SCREEN_RELAY_ICE_SERVERS', validate: (value, fromEnvironment) => {
+        const spec = String(value);
+        if (!iceServerSpec(spec)) return false;
+        if (!fromEnvironment && iceServerHasCredentials(spec)) {
+          return new Failure('invalid_input', 'ICE server credentials cannot be passed in --ice-server', 'Set credential-bearing TURN URLs in server.ice_servers in config.yaml or SCREEN_RELAY_ICE_SERVERS instead.');
+        }
+        return true;
+      } },
       { name: 'tls-cert', type: 'string', valueHint: '<FILE>', summary: 'Serve TLS with this certificate', environment: 'SCREEN_RELAY_TLS_CERT' },
       { name: 'tls-key', type: 'string', valueHint: '<FILE>', summary: 'Read the TLS private key', environment: 'SCREEN_RELAY_TLS_KEY' },
       { name: 'bind', type: 'string', valueHint: '<ADDRESS>', summary: 'Listen on this address', environment: 'SCREEN_RELAY_BIND', default: '127.0.0.1', deferredDefault: true },
@@ -87,10 +97,19 @@ export const commands: Record<string, Command> = {
       { description: 'Start a Wayland session on Linux', command: 'screen-relay up -d --backend wayland' },
       { description: 'Attach to the running Wayland compositor', command: 'screen-relay up -d --display "$WAYLAND_DISPLAY"' },
       { description: 'Attach to the current display on macOS', command: 'screen-relay up -d --backend macos' },
+      { description: 'Encode with x264 instead of choosing automatically', command: 'screen-relay up -d --encoder x264' },
     ],
     notes: ['Without --detach, Ctrl+C stops the session.', 'On Linux, --display uses the existing display size and defaults to no desktop. On macOS and Windows, screen-relay always attaches to the existing display.', 'Flags override config values. SCREEN_RELAY_CONFIG selects the config file.', 'Config-only settings and their variables: display.resolution (SCREEN_RELAY_RESOLUTION), stream.fps (SCREEN_RELAY_FPS), stream.bitrate.* (SCREEN_RELAY_BITRATE_MIN, SCREEN_RELAY_BITRATE_START, SCREEN_RELAY_BITRATE_MAX), keyboard.layout (SCREEN_RELAY_KEYBOARD_LAYOUT).', 'On a machine that is not set up yet, up installs the system packages and builds the engine first. At a terminal it asks before installing; anywhere else it needs --yes.'],
     resultSchema: { session: 'object', outcome: 'started' },
-    validate: (args) => args.display === '' ? new Failure('invalid_input', '--display is empty', 'Set WAYLAND_DISPLAY or DISPLAY, or drop --display to start a new desktop.') : undefined,
+    validate: (args) => {
+      if (args.display === '') return new Failure('invalid_input', '--display is empty', 'Set WAYLAND_DISPLAY or DISPLAY, or drop --display to start a new desktop.');
+      const servers = Array.isArray(args['ice-server']) ? args['ice-server'] : [];
+      if (servers.length > 8) return new Failure('invalid_input', `At most 8 ICE server entries; got ${servers.length}`, 'Pass up to 8 STUN or TURN server URLs.');
+      if (servers.length && Buffer.byteLength(`${servers.join('\n')}\n`, 'utf8') > 16384) {
+        return new Failure('invalid_input', 'ICE server entries exceed the 16 KiB limit', 'Shorten the STUN or TURN server list to fit within 16 KiB.');
+      }
+      return undefined;
+    },
     run: cmdUp,
   },
   down: { summary: 'Stop a session', group: 'Session', runsOn: 'vm', arguments: [], options: [], examples: example('Stop the default session', 'screen-relay down'), notes: ['Safe to repeat.'], resultSchema: { session: 'object', outcome: ['stopped', 'unchanged'] }, run: cmdDown },

@@ -51,6 +51,27 @@ A write returns `{"length":N}`, the number of bytes set, and an empty body clear
 
 `capabilities.clipboard` is `true` when the desktop has a clipboard the engine can use. On Wayland, the compositor must support the wlr-data-control protocol, which sway and labwc do.
 
+## WebRTC viewers
+
+A viewer link carries the transport in its fragment:
+
+| Fragment | Behavior |
+| --- | --- |
+| `#transport=auto` | Starts on the WebSocket stream at once, then upgrades to WebRTC in the background when the engine offers it and ICE succeeds. This is the default. |
+| `#transport=rtc` | Connects over WebRTC and falls back to the WebSocket stream when WebRTC fails. |
+| `#transport=rtc-only` | Connects over WebRTC only, with no fallback. A failed connection ends the stream. |
+| `#transport=ws` | Uses the WebSocket stream only. |
+
+Every viewer shares one encoder, so a WebRTC viewer joins the stream already running for the others. Each WebRTC viewer has its own session, so several can connect to one engine at once.
+
+WebRTC uses the servers from `server.ice_servers` or `--ice-server`. The flow is:
+
+1. `GET /rtc/config` returns `{"enabled":true,"iceServers":[{"urls":"stun:stun.example.com"}]}`. `enabled` is `false` when the engine was built without WebRTC.
+2. `POST /rtc` with the SDP offer as `application/sdp` returns `201` with the answer SDP and a `location` header such as `/rtc/sessions/ID`.
+3. `DELETE /rtc/sessions/ID` ends that session. `DELETE /rtc/session` ends the current session and remains as an alias for older clients.
+
+Each WebRTC session has an `events` data channel that carries cursor updates, owner clipboard notices, and viewer ACKs. A WebRTC viewer sends input over its `input` data channel while no other client owns input. A watch grant opens a view-only session, a grant-backed WebRTC session closes when its grant expires or is revoked, and only the session token or the grant that created the session can replace or end it. A failed offer returns `400` with an `error` field.
+
 ## Endpoints
 
 | Method | Path | What it does |
@@ -60,11 +81,16 @@ A write returns `{"length":N}`, the number of bytes set, and an empty body clear
 | `POST` | <span id="post-input" />`/input` | Sends a batch of binary input records. |
 | `GET`, `POST` | <span id="clipboard" />`/clipboard` | Reads or replaces the clipboard text. |
 | `GET` | <span id="get-metrics" />`/metrics` | Returns stream and resource metrics as JSON. |
-| `POST` | <span id="post-grants" />`/grants/watch`, `/grants/control` | Creates a [grant](/docs/remote-access#grants): a credential that opens only view-only streams, or only streams and `/control`. Add `?ttl=SECONDS`, up to 3600, which is also the default, and `connections=1` for a grant that opens one WebSocket. Returns `id`, `token`, `expires_in`, `scope`, and `connections` for a single-connection grant, as JSON. |
+| `GET` | <span id="get-rtc-config" />`/rtc/config` | Returns whether WebRTC is available and the ICE servers a viewer should use. |
+| `POST` | <span id="post-rtc" />`/rtc` | Exchanges an SDP offer for an answer and opens a WebRTC session. |
+| `DELETE` | <span id="delete-rtc-session" />`/rtc/sessions/ID` | Ends the WebRTC session with that `id`. `DELETE /rtc/session` does the same for the current session and stays as an alias. |
+| `POST` | <span id="post-grants" />`/grants/watch`, `/grants/control` | Creates a [grant](/docs/remote-access#grants): a credential that opens only view-only streams, or only streams and `/control`. Add `?ttl=SECONDS`, up to 3600, which is also the default, and `connections=1` for a grant that opens one connection. Returns `id`, `token`, `expires_in`, `scope`, and `connections` for a single-connection grant, as JSON. |
 | `DELETE` | <span id="delete-grants" />`/grants/ID` | Revokes the grant with that `id` and closes the connections opened with it. Returns 200. |
 | `GET` | `/`, `/index.html`, `/viewer.js` | Serves the viewer. |
 | WebSocket | `/stream` | Streams video and cursor images when supported. With no query parameter, it claims idle input. Use `?view=1` to watch without input or `?take=1` to take input from the current owner, which closes with code 4001. Add `clipboard=1` to a claiming or takeover stream to receive clipboard notices. |
 | WebSocket | `/control` | Sends input and receives a response for each event, without video. It can run next to a view-only `/stream`, and closes with code 4001 when a viewer takes control or code 4003 when it connects while input is owned. |
+
+`/capabilities` also reports `encoder`, the name of the active encoder; `hardware_encoder`; `encoder_state`, one of `uninitialized`, `probing`, `hardware_active`, `hardware_degraded`, `software_active`, or `failed`; `rtc`, which is `true` when the engine offers WebRTC; `ice_servers`, the number of configured STUN and TURN servers; and `transfer_tier`, one of `zero_copy`, `dirty_upload`, `full_upload`, or `software`, which names how captured frames reach the encoder.
 
 The viewer HTML is served with `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`, so another site cannot embed it and forward clicks to the desktop.
 
@@ -73,7 +99,8 @@ The engine sends no CORS headers. A browser page on another origin can open a We
 ## Authentication
 
 - When the session has a token, send `Authorization: Bearer TOKEN`. Do not put the token in a request URL. See [Tokens](/docs/remote-access#tokens).
-- A WebSocket can send a grant's `token` in place of the session token. A watch grant opens `/stream?view=1`. A control grant opens `/stream`, `/stream?take=1`, `/stream?view=1`, and `/control`. Neither opens a URL with `clipboard=1`, and neither authorizes an HTTP request. A grant WebSocket connects from any origin, including `null`. See [Grants](/docs/remote-access#grants).
+- A WebSocket can send a grant's `token` in place of the session token. A watch grant opens `/stream?view=1`. A control grant opens `/stream`, `/stream?take=1`, `/stream?view=1`, and `/control`. Neither opens a URL with `clipboard=1`, and neither authorizes other HTTP requests. A grant WebSocket connects from any origin, including `null`. See [Grants](/docs/remote-access#grants).
+- The WebRTC endpoints also accept a grant's `token`. A watch grant opens a view-only session, and a control grant opens a session that can send input.
 - The `Host` must be `localhost`, `127.0.0.1`, or the authority configured with `--public`, with its port if specified. For the `--public` authority, an uppercase host name and port 443 are normalized before the comparison.
 - `Origin` is optional. Requests without it still need an accepted `Host` and any required token. If present, `Origin` must match the configured `--public` origin, an entry in `--allow-origin`, or a loopback origin whose host and port match the loopback `Host` header. Without `--public`, loopback origins on other ports are also accepted. Other values, including `null`, are rejected. See [Browser origins](/docs/remote-access#browser-origins) for accepted formats and browser HTTP limits.
 
@@ -85,6 +112,7 @@ The engine sends no CORS headers. A browser page on another origin can open a We
 | --- | --- |
 | 400 `invalid_input` | Send a nonempty batch of valid records with the correct `Content-Length`. |
 | 400 `invalid_text` | Send clipboard text as UTF-8 without NUL characters. |
+| 400 `invalid_offer` | Send the SDP offer with a `Content-Length` from 1 byte to 64 KiB. |
 | 401 `unauthorized` | Send the correct session token. |
 | 403 `forbidden` | Check the `Host` and `Origin` rules under [Authentication](#authentication). |
 | 404 `not_found` | Check the endpoint path. |
@@ -95,6 +123,7 @@ The engine sends no CORS headers. A browser page on another origin can open a We
 | 413 `clipboard_too_large` | The clipboard holds more than the 256 KiB read limit. |
 | 422 `unsupported_input` | Change the input or keyboard layout. |
 | 503 `busy` | Wait for the other screenshot request to finish. |
+| 503 `rtc_busy` | Wait for the current WebRTC offer to finish. |
 | 503 `clipboard_busy` | Wait for the clipboard request queue to drain, then retry. |
 | 503 `clipboard_unavailable` | The desktop has no clipboard the engine can use, or the app that owns the clipboard did not answer within 2 seconds. Check `capabilities.clipboard`. |
 | 503 `screenshot_unavailable` | Check `screen-relay logs engine` and try again. |

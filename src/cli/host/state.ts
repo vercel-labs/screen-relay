@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +28,18 @@ export function writeSession(directory: string, data: SessionData): void {
   const temporary = join(directory, 'session.json.tmp');
   writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`);
   renameSync(temporary, join(directory, 'session.json'));
+}
+
+/** Writes a file only this user can read, removing any file or symlink already at that path instead of following it. */
+export function writePrivateFile(path: string, contents: string): void {
+  rmSync(path, { force: true });
+  const descriptor = openSync(path, 'wx', 0o600);
+  try {
+    fchmodSync(descriptor, 0o600);
+    writeFileSync(descriptor, contents);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export function cleanupWaylandRuntime(session: SessionData | null): boolean {

@@ -27,7 +27,7 @@ The engine uses the acknowledgements to adapt:
 
 ## Frame rate
 
-The stream runs at up to `stream.fps` frames per second, from 10 to 120. The default is 60. An idle desktop sends no frames, because the engine captures only when the screen changes.
+The stream runs at up to `stream.fps` frames per second, from 10 to 240. The default is 60. An idle desktop sends no frames, because the engine captures only when the screen changes.
 
 The compositor in screen-relay's own XFCE desktop repaints at most 60 times a second. When `stream.fps` is above 60, screen-relay turns it off so apps can update the screen faster. That also removes window shadows and transparency. Set `display.compositor` to `on` or `off` to decide this yourself; see [Configuration](/docs/configuration). A desktop you attach to with `--display` keeps its own settings.
 

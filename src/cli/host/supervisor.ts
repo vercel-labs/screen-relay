@@ -7,7 +7,7 @@ import { createClient } from '../../sdk/index.js';
 import { BACKENDS, backendValue } from '../config.js';
 import { Failure, nextFor, sessionCommand } from '../output.js';
 import { engineDirectory, HostArgs, isLinux, LAUNCHER_DIR, run, spawnCleared, which } from './common.js';
-import { cleanupWaylandRuntime, identity, SessionData, sweep, tail, writeSession } from './state.js';
+import { cleanupWaylandRuntime, identity, SessionData, sweep, tail, writePrivateFile, writeSession } from './state.js';
 import { engineEnvironment, engineWorkingDirectory } from './windows.js';
 
 export const BACKEND_PROGRAMS = {
@@ -42,6 +42,9 @@ export type SessionArgs = HostArgs & {
   'tls-key'?: string;
   keyboardLayout?: string;
   compositor?: string;
+  encoder?: string;
+  'ice-server'?: string[];
+  'ice-servers-file'?: string;
 };
 
 type EngineTarget = { url: string; token?: string | null; certificate?: string | null; connect?: string | null };
@@ -341,16 +344,18 @@ export class Session {
     let token: string | null = null;
     const engineCommand = [engine, '--bind', bind, '--port', String(this.args.port), '--fps', String(this.args.fps), '--bitrate-min', String(this.args.bitrateMin), '--bitrate-start', String(this.args.bitrateStart), '--bitrate-max', String(this.args.bitrateMax)];
     engineCommand.push('--backend', backend);
+    if (this.args.encoder && this.args.encoder !== 'auto') engineCommand.push('--encoder', this.args.encoder);
+    const iceServersFile = this.args['ice-servers-file'] ?? join(this.dir, 'ice-servers');
+    if (this.args['ice-server']?.length) writePrivateFile(iceServersFile, `${this.args['ice-server'].join('\n')}\n`);
+    if (this.args['ice-server']?.length || this.args['ice-servers-file']) engineCommand.push('--ice-servers-file', iceServersFile);
+    else rmSync(iceServersFile, { force: true });
     const viewer = join(LAUNCHER_DIR, '..', 'viewer');
     if (!existsSync(join(dirname(engine), 'viewer')) && existsSync(join(viewer, 'viewer.js'))) engineCommand.push('--viewer-dir', viewer);
     if (this.args.output) engineCommand.push('--output', this.args.output);
     if (bind !== '127.0.0.1' || this.args.public || this.args['allow-origin'] || attaches(backend)) {
       token = randomBytes(32).toString('hex');
       const tokenFile = join(this.dir, 'token');
-      const descriptor = openSync(tokenFile, 'w', 0o600);
-      fchmodSync(descriptor, 0o600);
-      writeFileSync(descriptor, `${token}\n`);
-      closeSync(descriptor);
+      writePrivateFile(tokenFile, `${token}\n`);
       engineCommand.push('--token-file', tokenFile);
       this.data.tokenFile = tokenFile;
     }
@@ -455,6 +460,7 @@ export class Session {
       }
     }
     await sweep(this.dir);
+    try { rmSync(join(this.dir, 'ice-servers'), { force: true }); } catch {}
     if (this.runtimeDir) {
       cleanupWaylandRuntime(this.data);
       delete this.env.XDG_RUNTIME_DIR;

@@ -20,7 +20,8 @@ function argumentSyntax(parameter: Parameter): string {
 }
 
 function optionSyntax(parameter: Parameter): string {
-  return `${parameter.short ? `-${parameter.short}, ` : ''}--${parameter.name}${parameter.valueHint ? ` ${parameter.valueHint}` : ''}`;
+  const value = `${parameter.valueHint ? ` ${parameter.valueHint}` : ''}${parameter.repeat === 'collect' ? '...' : ''}`;
+  return `${parameter.short ? `-${parameter.short}, ` : ''}--${parameter.name}${value}`;
 }
 
 function description(parameter: Parameter): string {
