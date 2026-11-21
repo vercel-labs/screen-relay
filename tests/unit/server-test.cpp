@@ -228,8 +228,8 @@ int main() {
   assert(!clipboardLength("0", length) && length == 0);
   assert(!clipboardLength("262144", length) && clipboardLength("262145", length) == HTTP_STATUS_REQ_ENTITY_TOO_LARGE);
   assert(validText("") && validText("caf\xc3\xa9 \xe2\x9c\x93 \xf0\x9f\x9a\x80\n"));
-  for (const std::string bad : {std::string("a\0b", 3), std::string("\xff"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"),
-                                std::string("\xf4\x90\x80\x80"), std::string("\xe2\x9c")}) {
+  for (const auto& bad : {std::string("a\0b", 3), std::string("\xff"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"),
+                         std::string("\xf4\x90\x80\x80"), std::string("\xe2\x9c")}) {
     assert(!validText(bad));
   }
   assert(jsonString("a\"b\\c\n\t\r\x01\xe2\x9c\x93") == "\"a\\\"b\\\\c\\n\\t\\r\\u0001\xe2\x9c\x93\"");

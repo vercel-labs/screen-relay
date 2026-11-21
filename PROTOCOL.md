@@ -99,7 +99,7 @@ Every message starts with this 20-byte header.
 | 4 | Server to `/control` | Desktop width and height, 2 bytes each. Sequence is zero. |
 | 5 | Server to `/control` | One status byte: 0 accepted, 1 invalid, 2 unsupported. Sequence echoes the request ID. A status of 0 does not report a later backend failure. |
 | 6 | Server to `/stream` | Width, height, hotspot X, and hotspot Y (2 bytes each), followed by straight-alpha RGBA pixels row by row. Sequence is zero. No ACK is needed. |
-| 7 | Server to a `/stream` opened with `clipboard=1` | Clipboard notice: the desktop clipboard changed, including changes from `POST /clipboard`. Empty payload, sequence zero, no ACK. Read the text with `GET /clipboard`. |
+| 7 | Server to a `/stream` opened with `clipboard=1` | Clipboard notice: a desktop application changed the clipboard. Changes made through `POST /clipboard` do not send a notice. Empty payload, sequence zero, no ACK. Read the text with `GET /clipboard`. |
 
 | Rule | Detail |
 | --- | --- |

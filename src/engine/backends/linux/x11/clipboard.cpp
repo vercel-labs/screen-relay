@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <fcntl.h>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -32,17 +33,6 @@ std::string fromLatin1(const std::string& text) {
   }
   return out;
 }
-/// Latin-1 for UTF-8 text, with characters outside Latin-1 as '?'.
-std::string toLatin1(const std::string& text) {
-  std::string out;
-  for (size_t i = 0; i < text.size();) {
-    const unsigned char c = text[i];
-    const size_t length = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
-    out += c < 0x80 ? char(c) : length == 2 && c <= 0xc3 ? char(((c & 0x1f) << 6) | (text[i + 1] & 0x3f)) : '?';
-    i += length;
-  }
-  return out;
-}
 /**
  * The CLIPBOARD selection on its own X connection and thread. A write makes the engine the selection owner, which
  * answers other clients until one of them takes the selection. A read converts the selection into a property on the
@@ -58,7 +48,9 @@ class X11Clipboard final : public ClipboardBackend {
   ClipboardChanged changed;
   Display* display = nullptr;
   Window window = 0;
-  Atom clipboard = 0, utf8 = 0, targets = 0, textTarget = 0, incr = 0, property = 0;
+  Atom clipboard = 0, utf8 = 0, textPlainUtf8 = 0, textPlain = 0;
+  Atom targets = 0, textTarget = 0, timestampAtom = 0, incr = 0, property = 0;
+  Time ownedTime = CurrentTime;
   int fixesEvent = 0, wake[2] = {-1, -1};
   size_t maxProperty = 0;
   std::optional<std::string> owned;
@@ -98,6 +90,7 @@ class X11Clipboard final : public ClipboardBackend {
     active = request;
     if (request->text) {
       owned = request->text;
+      ownedTime = CurrentTime;
       XSetSelectionOwner(display, clipboard, window, CurrentTime);
       const bool ok = XGetSelectionOwner(display, clipboard) == window;
       if (!ok) owned.reset();
@@ -127,7 +120,9 @@ class X11Clipboard final : public ClipboardBackend {
   void selectionNotify(const XSelectionEvent& event) {
     if (transfer != Transfer::converting || event.requestor != window || event.selection != clipboard || event.target != requested) return;
     if (event.property == None) {
-      if (requested == utf8) convert(XA_STRING);
+      if (requested == utf8) convert(textPlainUtf8);
+      else if (requested == textPlainUtf8) convert(textPlain);
+      else if (requested == textPlain) convert(XA_STRING);
       else finish(std::string(), true);
       return;
     }
@@ -156,14 +151,20 @@ class X11Clipboard final : public ClipboardBackend {
     const Atom target = request.property == None ? request.target : request.property;
     if (request.selection == clipboard && owned) {
       if (request.target == targets) {
-        const Atom offered[] = {targets, utf8, textTarget, XA_STRING};
+        const Atom offered[] = {targets, utf8, textPlainUtf8, textPlain, textTarget, XA_STRING, timestampAtom};
         XChangeProperty(display, request.requestor, target, XA_ATOM, 32, PropModeReplace,
-                        reinterpret_cast<const unsigned char*>(offered), 4);
+                        reinterpret_cast<const unsigned char*>(offered), int(std::size(offered)));
         reply.property = target;
-      } else if (request.target == utf8 || request.target == textTarget || request.target == XA_STRING) {
-        const std::string text = request.target == XA_STRING ? toLatin1(*owned) : *owned;
+      } else if (request.target == timestampAtom) {
+        XChangeProperty(display, request.requestor, target, XA_INTEGER, 32, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(&ownedTime), 1);
+        reply.property = target;
+      } else if (request.target == utf8 || request.target == textPlainUtf8 || request.target == textPlain ||
+                 request.target == textTarget || request.target == XA_STRING) {
+        const bool latin1 = request.target == textTarget || request.target == XA_STRING;
+        const std::string text = latin1 ? clipboard_detail::toLatin1(*owned) : *owned;
         if (text.size() <= maxProperty) {
-          XChangeProperty(display, request.requestor, target, request.target == XA_STRING ? XA_STRING : utf8, 8,
+          XChangeProperty(display, request.requestor, target, latin1 ? XA_STRING : request.target, 8,
                           PropModeReplace, reinterpret_cast<const unsigned char*>(text.data()), int(text.size()));
           reply.property = target;
         }
@@ -173,7 +174,15 @@ class X11Clipboard final : public ClipboardBackend {
     XFlush(display);
   }
   void handle(XEvent& event) {
-    if (event.type == fixesEvent + XFixesSelectionNotify) { changed(); return; }
+    if (event.type == fixesEvent + XFixesSelectionNotify) {
+      const auto& fix = reinterpret_cast<const XFixesSelectionNotifyEvent&>(event);
+      if (fix.subtype == XFixesSetSelectionOwnerNotify && fix.owner == window) {
+        ownedTime = fix.selection_timestamp;
+        return;
+      }
+      changed();
+      return;
+    }
     switch (event.type) {
       case SelectionNotify: selectionNotify(event.xselection); break;
       case PropertyNotify: propertyNotify(event.xproperty); break;
@@ -235,8 +244,11 @@ class X11Clipboard final : public ClipboardBackend {
     XSelectInput(display, window, PropertyChangeMask);
     clipboard = XInternAtom(display, "CLIPBOARD", False);
     utf8 = XInternAtom(display, "UTF8_STRING", False);
+    textPlainUtf8 = XInternAtom(display, "text/plain;charset=utf-8", False);
+    textPlain = XInternAtom(display, "text/plain", False);
     targets = XInternAtom(display, "TARGETS", False);
     textTarget = XInternAtom(display, "TEXT", False);
+    timestampAtom = XInternAtom(display, "TIMESTAMP", False);
     incr = XInternAtom(display, "INCR", False);
     property = XInternAtom(display, "RELAY_CLIPBOARD", False);
     const long units = XExtendedMaxRequestSize(display) ? XExtendedMaxRequestSize(display) : XMaxRequestSize(display);

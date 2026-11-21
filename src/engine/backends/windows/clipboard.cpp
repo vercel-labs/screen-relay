@@ -1,7 +1,9 @@
 #include "core/clipboard.hpp"
 #include <windows.h>
+#include <cstring>
 #include <cwchar>
 #include <future>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -29,6 +31,15 @@ std::string utf8(const wchar_t* text, size_t length) {
   WideCharToMultiByte(CP_UTF8, 0, lines.data(), int(lines.size()), result.data(), size, nullptr, nullptr);
   return result;
 }
+std::optional<std::string> ansiUtf8(const char* text, size_t length) {
+  if (!length) return std::string();
+  if (length > size_t(std::numeric_limits<int>::max())) return std::nullopt;
+  const int size = MultiByteToWideChar(CP_ACP, 0, text, int(length), nullptr, 0);
+  if (!size) return std::nullopt;
+  std::wstring wide(size_t(size), L'\0');
+  if (!MultiByteToWideChar(CP_ACP, 0, text, int(length), wide.data(), size)) return std::nullopt;
+  return utf8(wide.data(), wide.size());
+}
 /// UTF-16 for UTF-8 text with LF turned into CRLF; empty when the text is not valid UTF-8.
 std::wstring utf16(const std::string& text) {
   std::wstring wide;
@@ -52,12 +63,17 @@ std::wstring utf16(const std::string& text) {
 class WindowsClipboard final : public ClipboardBackend {
   ClipboardChanged changed;
   HWND window = nullptr;
+  DWORD written_sequence = 0;
   std::thread thread;
 
   static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     auto* self = reinterpret_cast<WindowsClipboard*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (message) {
-      case WM_CLIPBOARDUPDATE: if (self) self->changed(); return 0;
+      case WM_CLIPBOARDUPDATE:
+        if (!self || GetClipboardOwner() == hwnd ||
+            (self->written_sequence && GetClipboardSequenceNumber() == self->written_sequence)) return 0;
+        self->changed();
+        return 0;
       case readMessage: *reinterpret_cast<std::optional<std::string>*>(lparam) = self->readHere(); return 0;
       case writeMessage: return self->writeHere(*reinterpret_cast<const std::string*>(lparam));
       case WM_CLOSE: DestroyWindow(hwnd); return 0;
@@ -68,9 +84,18 @@ class WindowsClipboard final : public ClipboardBackend {
   std::optional<std::string> readHere() {
     if (!openClipboard(window)) return std::nullopt;
     std::optional<std::string> text = std::string();
-    if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
-      if (const auto* wide = static_cast<const wchar_t*>(GlobalLock(data))) {
-        text = utf8(wide, wcsnlen(wide, GlobalSize(data) / sizeof(wchar_t)));
+    const bool unicode = IsClipboardFormatAvailable(CF_UNICODETEXT);
+    if (HANDLE data = GetClipboardData(unicode ? CF_UNICODETEXT : CF_TEXT)) {
+      if (const void* bytes = GlobalLock(data)) {
+        const size_t size = GlobalSize(data);
+        if (unicode) {
+          const auto* wide = static_cast<const wchar_t*>(bytes);
+          text = utf8(wide, wcsnlen(wide, size / sizeof(wchar_t)));
+        } else {
+          const auto* ansi = static_cast<const char*>(bytes);
+          const auto* end = static_cast<const char*>(std::memchr(ansi, '\0', size));
+          text = ansiUtf8(ansi, end ? size_t(end - ansi) : size);
+        }
         GlobalUnlock(data);
       } else {
         text.reset();
@@ -89,6 +114,7 @@ class WindowsClipboard final : public ClipboardBackend {
     GlobalUnlock(data);
     if (!openClipboard(window)) { GlobalFree(data); return false; }
     const bool written = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, data);
+    if (written) written_sequence = GetClipboardSequenceNumber();
     CloseClipboard();
     if (!written) GlobalFree(data);
     return written;

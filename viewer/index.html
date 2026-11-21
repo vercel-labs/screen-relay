@@ -16,6 +16,7 @@ body{font:13px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:#ededed}
   width:min(100vw,calc(100dvh*var(--w)/var(--h)));height:min(100dvh,calc(100vw*var(--h)/var(--w)))}
 body.actual #stage{overflow:auto}
 #cursor{position:fixed;pointer-events:none;z-index:1}
+#clipboard-sink{position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;padding:0;resize:none}
 #toolbar{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:3;display:flex;flex-direction:column;align-items:center;gap:6px}
 .bar,.panel{background:rgba(12,12,12,.86);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
   border:1px solid rgba(255,255,255,.12);box-shadow:0 8px 24px rgba(0,0,0,.45)}
@@ -47,6 +48,7 @@ button:focus-visible,input:focus-visible{outline:2px solid #3b82f6;outline-offse
 <body>
 <main id="stage"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="Remote desktop. Focus to send keyboard and pointer input."></canvas></main>
 <canvas id="cursor" width="1" height="1" aria-hidden="true" hidden></canvas>
+<textarea id="clipboard-sink" aria-hidden="true" tabindex="-1" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
 <div id="stats" hidden><span id="hud" aria-label="Stream statistics">Stream 1280x720 · Drawn FPS: 0.0 · Stream Mbps: 0.00 · Cgroup CPU (one core): unavailable · Cgroup RAM: unavailable</span></div>
 <nav id="toolbar" aria-label="Viewer controls">
   <div class="bar">

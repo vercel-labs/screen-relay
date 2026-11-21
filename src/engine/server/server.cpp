@@ -219,7 +219,7 @@ bool Server::streamMessage(Stream& stream) {
   if (input_viewer != stream.viewer) return true;
   return input->apply(inputEvent(b.data()+20)) != InputStatus::invalid;
 }
-void Server::Stream::updateFlow(bool proxy) {
+void Server::Stream::updateFlow([[maybe_unused]] bool proxy) {
   if (viewer && !lws_partial_buffered(viewer)) buffered_stream_bytes = 0;
 #ifdef __linux__
   const auto sample = viewer && !proxy ? streamTransportSample(viewer, buffered_stream_bytes) : std::nullopt;
@@ -348,24 +348,31 @@ int Server::Stream::write(bool proxy) {
   updateFlow(proxy);
   std::optional<EncodedFrame> frame;
   std::optional<CursorImage> cursor;
+  const bool send_notice = lastSequence && clipboard_pending;
+  { std::lock_guard<std::mutex> lock(mutex);
+    if (failed) return -1;
+    if (!send_notice) {
+      // Start with video to establish the generation; then share writes fairly.
+      if (lastSequence && pending_cursor && (!last_write_cursor || pending.empty())) {
+        cursor = std::move(pending_cursor); pending_cursor.reset();
+      } else {
+        if (pending.empty()) return 0;
+        frame.emplace(std::move(pending.front())); pending.pop_front();
+      }
+    }
+  }
   std::vector<uint8_t> wire;
-  if (lastSequence && clipboard_pending) {
+  if (send_notice) {
+    if (lws_partial_buffered(wsi)) {
+      lws_callback_on_writable(wsi);
+      return 0;
+    }
     clipboardNotice(wire, LWS_PRE, generation);
     const size_t size = wire.size() - LWS_PRE;
     if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
     clipboard_pending = false;
     lws_callback_on_writable(wsi);
     return 0;
-  }
-  { std::lock_guard<std::mutex> lock(mutex);
-    if (failed) return -1;
-    // Start with video to establish the generation; then share writes fairly.
-    if (lastSequence && pending_cursor && (!last_write_cursor || pending.empty())) {
-      cursor = std::move(pending_cursor); pending_cursor.reset();
-    } else {
-      if (pending.empty()) return 0;
-      frame.emplace(std::move(pending.front())); pending.pop_front();
-    }
   }
   if (cursor) {
     if (!cursorMessage(wire, LWS_PRE, generation, *cursor)) return -1;
@@ -748,6 +755,11 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       return s->control == wsi ? s->writeControl(wsi) : -1;
     }
     case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+      if (s->clipboard_changed.exchange(false) && s->input_viewer) {
+        if (auto* stream = s->streamFor(s->input_viewer); stream && stream->clipboard_notices) {
+          stream->clipboard_pending = true;
+        }
+      }
       for (const auto& stream : s->streams) if (stream && stream->viewer) {
         stream->updateFlow(s->config.proxy);
         lws_callback_on_writable(stream->viewer);
@@ -761,13 +773,6 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         response->reply_status = reply->status;
         response->input_reply = true; response->input_headers = false;
         lws_callback_on_writable(reply->wsi);
-      }
-      if (s->clipboard_changed.exchange(false) && s->input_viewer) {
-        auto* stream = s->streamFor(s->input_viewer);
-        if (stream && stream->clipboard_notices) {
-          stream->clipboard_pending = true;
-          lws_callback_on_writable(stream->viewer);
-        }
       }
       for (auto& reply : s->clipboard.take()) {
         auto* response = static_cast<HttpResponse*>(lws_wsi_user(reply.client));

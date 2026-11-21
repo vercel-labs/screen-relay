@@ -15,8 +15,19 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
       get textContent() { return this.text; },
       set textContent(value) { this.text = value; this.textWrites++; },
       getContext: () => ({ drawImage(frame) { trace.push(['draw', frame.timestamp]); } }),
-      addEventListener(name, callback) { this.handlers[name] = callback; },
-      setAttribute(name, value) { this.attributes[name] = String(value); }, focus() {},
+      addEventListener(name, callback) {
+        const previous = this.handlers[name];
+        this.handlers[name] = previous ? (event) => { previous(event); callback(event); } : callback;
+      },
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      focus() {
+        const previous = document.activeElement;
+        if (previous === this) return;
+        document.activeElement = document.body;
+        previous?.handlers.blur?.({ relatedTarget: this });
+        document.activeElement = this;
+      },
+      setPointerCapture() {},
       querySelector: (selector) => children[selector] ||= element(),
       getBoundingClientRect: () => ({ left: 0, top: 0, right: 1280, bottom: 720, width: 1280, height: 720 }),
     };
@@ -51,10 +62,12 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
     close() { this.state = 'closed'; }
   }
   const document = {
-    hidden: false, body: element(), documentElement: element(), hasFocus: () => true,
+    hidden: false, body: element(), documentElement: element(), focused: true,
+    hasFocus() { return this.focused; },
     querySelector: (selector) => elements[selector] ||= element(),
     addEventListener: (name, callback) => { listeners[name] = callback; },
   };
+  document.activeElement = document.body;
   const context = createContext({
     document, window: { devicePixelRatio, VideoDecoder: Decoder, EncodedVideoChunk: true, addEventListener: (name, callback) => { windowListeners[name] = callback; } },
     location: { protocol: 'http:', hostname: 'localhost', host: 'localhost', hash, pathname: '/', search: '' },
@@ -63,16 +76,17 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
     EncodedVideoChunk: class { constructor(options) { Object.assign(this, options); } },
     MutationObserver: class { observe() {} }, ResizeObserver: class { observe() {} },
     performance: { now: () => now }, setInterval: () => 1, clearInterval() {},
-    setTimeout: (callback) => timers.push(callback), clearTimeout() {}, navigator,
+    setTimeout: (callback) => timers.push(callback) - 1,
+    clearTimeout(id) { delete timers[id]; }, navigator,
     requestAnimationFrame(callback) { const id = nextAnimationFrame++; animationFrames.set(id, callback); return id; },
     cancelAnimationFrame(id) { animationFrames.delete(id); },
     fetch, localStorage: storage,
   });
   runInContext(readFileSync('dist/viewer/viewer.js', 'utf8'), context);
-  const frame = (seq, width = 1280, height = 720, payloadLength = 8, stamp = seq) => runInContext(`(() => {
+  const frame = (seq, width = 1280, height = 720, payloadLength = 8, stamp = seq, generation = 1) => runInContext(`(() => {
     const data = new ArrayBuffer(${32 + payloadLength}), view = new DataView(data);
     view.setUint32(0, 0x4e534c31); view.setUint8(4, 1); view.setUint8(5, 1);
-    view.setUint16(6, ${seq === 1 ? 1 : 0}); view.setUint32(8, 1); view.setUint32(12, ${seq});
+    view.setUint16(6, ${seq === 1 ? 1 : 0}); view.setUint32(8, ${generation}); view.setUint32(12, ${seq});
     view.setUint32(16, ${12 + payloadLength}); view.setUint16(20, ${width}); view.setUint16(22, ${height});
     view.setBigUint64(24, ${stamp}n); new Uint8Array(data, 32).set([0, 0, 1, 103, 66, 0, 30, 0]);
     relayViewer.socket.onmessage({ data });
@@ -91,8 +105,13 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
     animationFrames.delete(entry[0]);
     entry[1](now);
   };
-  const timersAfter = (mark) => { for (const callback of timers.splice(mark)) callback(); };
-  return { context, document, listeners, windowListeners, sockets, trace, frame, tick, refresh, timerCount: () => timers.length, timersAfter, runTimer: (index) => timers.splice(index, 1)[0](), setTime: (time) => { now = time; }, decodeAll: () => { while (decodeQueue.length) decodeQueue.shift()(); } };
+  const runTimer = (index) => {
+    const callback = timers[index];
+    delete timers[index];
+    callback?.();
+  };
+  const timersAfter = (mark) => { const end = timers.length; for (let index = mark; index < end; index++) runTimer(index); };
+  return { context, document, listeners, windowListeners, sockets, trace, frame, tick, refresh, timerCount: () => timers.length, timersAfter, runTimer, setTime: (time) => { now = time; }, decodeAll: () => { while (decodeQueue.length) decodeQueue.shift()(); } };
 }
 
 const traced = (app, type) => app.trace.filter((event) => event[0] === type).map((event) => event[1]);
@@ -717,7 +736,7 @@ test('an automatic reconnect claims idle input without taking it from another ow
   assert.equal(app.sockets.at(-1).url, 'ws://localhost/stream?view=1');
 });
 
-function clipboardViewer(remoteText = '', upload, { read, write } = {}) {
+function clipboardViewer(remoteText = '', upload, { read, write, localRead, ready = true } = {}) {
   const posted = [], written = [];
   const json = (body) => ({ ok: true, status: 200, json: async () => body });
   const app = viewer({
@@ -727,74 +746,153 @@ function clipboardViewer(remoteText = '', upload, { read, write } = {}) {
       if (path === '/clipboard') return read ? read() : json({ text: remoteText });
       return { ok: false, status: 404 };
     },
-    navigator: { clipboard: { writeText: async (text) => { if (write) await write(text); written.push(text); } } },
+    navigator: { clipboard: { readText: localRead, writeText: async (text) => { if (write) await write(text); written.push(text); } } },
   });
   runInContext('relayViewer.setViewOnly(false)', app.context);
-  app.frame(1);
-  return { app, posted, written, setRemote: (text) => { remoteText = text; } };
+  const canvas = app.document.querySelector('#screen'), sink = app.document.querySelector('#clipboard-sink');
+  canvas.focus();
+  if (ready) app.frame(1);
+  return { app, canvas, sink, posted, written, setRemote: (text) => { remoteText = text; } };
 }
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 function chord(app, type, code, modifiers = {}) {
-  app.document.querySelector('#screen').handlers[type]({
-    code, repeat: false, ctrlKey: false, metaKey: false, altKey: false, ...modifiers, preventDefault() {}, getModifierState: () => false,
+  let prevented = false;
+  app.document.activeElement.handlers[type]({
+    code, repeat: false, ctrlKey: false, metaKey: false, altKey: false, ...modifiers,
+    preventDefault() { prevented = true; }, getModifierState: () => false,
   });
+  return prevented;
 }
-function clipboardNotice(app) {
+function clipboardNotice(app, generation = 1) {
   runInContext(`(() => {
     const data = new ArrayBuffer(20), view = new DataView(data);
-    view.setUint32(0, 0x4e534c31); view.setUint8(4, 1); view.setUint8(5, 7); view.setUint32(8, 1);
+    view.setUint32(0, 0x4e534c31); view.setUint8(4, 1); view.setUint8(5, 7); view.setUint32(8, ${generation});
     relayViewer.socket.onmessage({ data });
   })()`, app.context);
 }
+function clipboardAction(app, action) {
+  const panel = app.document.querySelector('#clipboard-panel');
+  panel.hidden = false;
+  panel.handlers.click({ target: { closest: () => ({ dataset: { clipboard: action } }) } });
+  return panel;
+}
+const controlPaste = [[1, 224], [1, 25], [2, 25], [2, 224]];
 
-test('a paste shortcut puts the local text on the remote clipboard before the remote paste', async () => {
-  const { app, posted } = clipboardViewer();
+test('native paste uses the sink without releasing input, then restores focus and uploads before replay', async () => {
+  const { app, canvas, sink, posted } = clipboardViewer();
   await settle();
   chord(app, 'keydown', 'ControlLeft', { ctrlKey: true });
-  chord(app, 'keydown', 'KeyV', { ctrlKey: true });
-  assert.deepEqual(inputBytes(app), [[1, 224]]);
-  app.listeners.paste({ preventDefault() {}, clipboardData: { getData: () => 'local ✓\r\nline' } });
+  sink.value = 'old';
+  assert.equal(chord(app, 'keydown', 'KeyV', { ctrlKey: true }), false);
+  assert.equal(app.document.activeElement, sink);
+  assert.equal(sink.value, '');
   chord(app, 'keyup', 'ControlLeft');
+  assert.deepEqual(inputBytes(app), [[1, 224]]);
+  sink.value = 'captured';
+  let prevented = false;
+  app.listeners.paste({ preventDefault() { prevented = true; }, clipboardData: { getData: () => 'local ✓\r\nline' } });
+  assert.equal(prevented, true);
+  assert.equal(app.document.activeElement, canvas);
+  assert.equal(sink.value, '');
   await settle();
   assert.deepEqual(posted, ['local ✓\nline']);
-  assert.deepEqual(inputBytes(app), [[1, 224], [1, 25], [2, 25], [2, 224]]);
+  assert.deepEqual(inputBytes(app), controlPaste);
   chord(app, 'keyup', 'KeyV');
   assert.equal(inputBytes(app).length, 4);
-  chord(app, 'keydown', 'KeyV', { ctrlKey: true });
-  app.listeners.paste({ preventDefault() {}, clipboardData: { getData: () => 'local ✓\r\nline' } });
+  pasteText(app, 'local ✓\r\nline');
   await settle();
   assert.deepEqual(posted, ['local ✓\nline', 'local ✓\nline']);
 });
 
-test('input after a paste waits for the upload and follows the paste in order', async () => {
+test('plain v typed during a paste upload follows the paste and modifier release in order', async () => {
   let complete;
   const { app } = clipboardViewer('', () => new Promise((resolve) => { complete = resolve; }));
   await settle();
   chord(app, 'keydown', 'ControlLeft', { ctrlKey: true });
   pasteText(app, 'local');
+  chord(app, 'keydown', 'KeyV', { ctrlKey: true, repeat: true });
   chord(app, 'keyup', 'KeyV', { ctrlKey: true });
   chord(app, 'keyup', 'ControlLeft');
-  chord(app, 'keydown', 'Enter');
-  chord(app, 'keyup', 'Enter');
+  chord(app, 'keydown', 'KeyV');
+  chord(app, 'keyup', 'KeyV');
   assert.deepEqual(inputBytes(app), [[1, 224]]);
   complete({ ok: true });
   await settle();
-  assert.deepEqual(inputBytes(app), [[1, 224], [1, 25], [2, 25], [2, 224], [1, 40], [2, 40]]);
+  assert.deepEqual(inputBytes(app), [...controlPaste, [1, 25], [2, 25]]);
+  assert.equal(app.sockets.at(-1).inputs.at(-2).modifiers, 0);
+});
+
+test('a latched Shift wraps the paste but not the next queued key', async () => {
+  const { app } = clipboardViewer();
+  await settle();
+  const hold = { dataset: { hold: 'ShiftLeft' }, setAttribute(name, value) { this[name] = value; } };
+  app.document.querySelector('#keys-panel').handlers.click({ target: { closest: (selector) => selector === '[data-hold]' ? hold : null } });
+  pasteText(app, 'local');
+  chord(app, 'keydown', 'KeyA');
+  await settle();
+  assert.deepEqual(inputBytes(app), [[1, 225], ...controlPaste, [2, 225], [1, 4]]);
+  const inputs = app.sockets.at(-1).inputs;
+  assert.equal(inputs[2].modifiers, 3);
+  assert.equal(inputs.at(-1).modifiers, 0);
+  assert.equal(hold['aria-pressed'], 'false');
 });
 
 test('a paste shortcut without local text pastes what the remote clipboard holds', async () => {
-  const { app, posted } = clipboardViewer();
+  const { app, canvas, posted } = clipboardViewer();
   await settle();
   chord(app, 'keydown', 'ControlLeft', { ctrlKey: true });
   const mark = app.timerCount();
   chord(app, 'keydown', 'KeyV', { ctrlKey: true });
   app.timersAfter(mark);
+  assert.equal(app.document.activeElement, canvas);
   assert.deepEqual(posted, []);
   assert.deepEqual(inputBytes(app), [[1, 224], [1, 25], [2, 25]]);
 });
 
-test('a remote copy reaches the local clipboard, but neither the viewer\'s own paste nor empty text is copied back', async () => {
-  const { app, written, setRemote } = clipboardViewer('remote text');
+test('without a native paste event, readText uploads and replays Cmd+V with a missing modifier', async () => {
+  const { app, canvas, sink, posted } = clipboardViewer('', undefined, { localRead: async () => 'fallback' });
+  await settle();
+  const mark = app.timerCount();
+  assert.equal(chord(app, 'keydown', 'KeyV', { metaKey: true }), false);
+  assert.equal(app.document.activeElement, sink);
+  app.runTimer(mark);
+  assert.equal(app.document.activeElement, canvas);
+  assert.deepEqual(inputBytes(app), []);
+  await settle();
+  assert.deepEqual(posted, ['fallback']);
+  assert.deepEqual(app.sockets.at(-1).inputs, [
+    { event: 1, code: 227, modifiers: 8 }, { event: 1, code: 25, modifiers: 8 },
+    { event: 2, code: 25, modifiers: 8 }, { event: 2, code: 227, modifiers: 0 },
+  ]);
+});
+
+test('an unresolved readText falls back to the remote clipboard and ignores a late result', async () => {
+  let complete;
+  const { app, posted } = clipboardViewer('', undefined, { localRead: () => new Promise((resolve) => { complete = resolve; }) });
+  await settle();
+  const mark = app.timerCount();
+  chord(app, 'keydown', 'KeyV', { ctrlKey: true });
+  app.runTimer(mark);
+  assert.deepEqual(inputBytes(app), []);
+  app.runTimer(mark + 1);
+  await settle();
+  assert.deepEqual(inputBytes(app), controlPaste);
+  complete('late');
+  await settle();
+  assert.deepEqual(posted, []);
+});
+
+test('a shortcut before the stream is ready cannot capture or upload a paste', async () => {
+  const { app, canvas, posted } = clipboardViewer('', undefined, { ready: false });
+  await settle();
+  pasteText(app, 'local');
+  assert.equal(app.document.activeElement, canvas);
+  assert.deepEqual(inputBytes(app), []);
+  assert.deepEqual(posted, []);
+});
+
+test('a remote copy reaches the host, but the viewer\'s own paste and empty text are not copied back', async () => {
+  const { app, posted, written, setRemote } = clipboardViewer('remote text');
   await settle();
   clipboardNotice(app);
   await settle();
@@ -809,6 +907,21 @@ test('a remote copy reaches the local clipboard, but neither the viewer\'s own p
   clipboardNotice(app);
   await settle();
   assert.deepEqual(written, ['remote text']);
+  pasteText(app, 'after empty');
+  await settle();
+  assert.deepEqual(posted, ['pasted', 'after empty']);
+});
+
+test('a stale-generation clipboard notice cannot take precedence over a local paste', async () => {
+  const { app, posted, written } = clipboardViewer('remote');
+  await settle();
+  app.frame(1, undefined, undefined, undefined, undefined, 2);
+  chord(app, 'keydown', 'KeyV', { ctrlKey: true });
+  clipboardNotice(app, 1);
+  app.listeners.paste({ preventDefault() {}, clipboardData: { getData: () => 'local' } });
+  await settle();
+  assert.deepEqual(posted, ['local']);
+  assert.deepEqual(written, []);
 });
 
 function pasteText(app, text) {
@@ -866,7 +979,7 @@ test('successive copy shortcuts keep the observation open until the latest windo
   assert.deepEqual(posted, ['local']);
 });
 
-test('the latest remote copy notice refreshes even text that was previously synced', async () => {
+test('a timed-out copy does not force a later notice to write previously synced text', async () => {
   const reads = [];
   const { app, posted, written } = clipboardViewer('', undefined, { read: () => new Promise((resolve) => reads.push(resolve)) });
   await settle();
@@ -879,11 +992,11 @@ test('the latest remote copy notice refreshes even text that was previously sync
   clipboardNotice(app);
   clipboardNotice(app);
   pasteText(app, 'stale');
-  reads[0]({ ok: true, json: async () => ({ text: 'same' }) });
   reads[1]({ ok: true, json: async () => ({ text: 'same' }) });
+  reads[0]({ ok: true, json: async () => ({ text: 'superseded' }) });
   await settle();
   assert.deepEqual(posted, ['same']);
-  assert.deepEqual(written, ['same']);
+  assert.deepEqual(written, []);
 });
 
 test('a remote notice between the paste shortcut and paste event keeps remote precedence', async () => {
@@ -895,7 +1008,7 @@ test('a remote notice between the paste shortcut and paste event keeps remote pr
   app.listeners.paste({ preventDefault() {}, clipboardData: { getData: () => 'stale' } });
   await settle();
   assert.deepEqual(posted, []);
-  assert.deepEqual(inputBytes(app), [[1, 25], [2, 25]]);
+  assert.deepEqual(inputBytes(app), controlPaste);
 });
 
 test('a paste during a pending remote copy does not upload stale local text', async () => {
@@ -905,7 +1018,7 @@ test('a paste during a pending remote copy does not upload stale local text', as
   clipboardNotice(app);
   pasteText(app, 'stale');
   assert.deepEqual(posted, []);
-  assert.deepEqual(inputBytes(app), [[1, 25], [2, 25]]);
+  assert.deepEqual(inputBytes(app), controlPaste);
   complete({ ok: true, json: async () => ({ text: 'remote' }) });
   await settle();
   assert.deepEqual(written, ['remote']);
@@ -924,15 +1037,106 @@ test('a paste while a remote copy is being written locally does not upload stale
   assert.deepEqual(written, ['remote']);
 });
 
-test('a failed local clipboard write keeps the remote clipboard authoritative', async () => {
-  const { app, posted } = clipboardViewer('remote', undefined, { write: async () => { throw new Error('denied'); } });
+for (const recovery of ['fresh host text', 'blur and refocus']) {
+  test(`a failed host write preserves the remote clipboard until ${recovery}`, async () => {
+    const { app, posted, written } = clipboardViewer('remote', undefined, { write: async () => { throw new Error('denied'); } });
+    await settle();
+    pasteText(app, 'host');
+    await settle();
+    clipboardNotice(app);
+    await settle();
+    pasteText(app, 'host');
+    await settle();
+    assert.deepEqual(posted, ['host']);
+    assert.deepEqual(inputBytes(app).slice(-4), controlPaste);
+    if (recovery === 'blur and refocus') {
+      app.document.focused = false;
+      app.windowListeners.blur();
+      clipboardNotice(app);
+      app.document.focused = true;
+    }
+    const text = recovery === 'fresh host text' ? 'new' : 'host';
+    pasteText(app, text);
+    await settle();
+    assert.deepEqual(posted, ['host', text]);
+    assert.deepEqual(written, []);
+  });
+}
+
+for (const gesture of ['keydown', 'pointerdown']) {
+  test(`a ${gesture} gesture can retry a denied remote-to-host clipboard write`, async () => {
+    let gestureActive = false;
+    const { app, canvas, written } = clipboardViewer('remote', undefined, { write: async () => {
+      if (!gestureActive) throw new Error('activation required');
+    } });
+    await settle();
+    clipboardNotice(app);
+    await settle();
+    assert.deepEqual(written, []);
+    gestureActive = true;
+    if (gesture === 'keydown') chord(app, 'keydown', 'KeyA');
+    else canvas.handlers.pointerdown({ button: 0, clientX: 10, clientY: 10, preventDefault() {} });
+    gestureActive = false;
+    await settle();
+    assert.deepEqual(written, ['remote']);
+  });
+}
+
+test('a copy queued behind an upload protects the following paste', async () => {
+  let complete;
+  const { app, posted, written } = clipboardViewer('remote', () => new Promise((resolve) => { complete = resolve; }));
   await settle();
+  chord(app, 'keydown', 'ControlLeft', { ctrlKey: true });
+  pasteText(app, 'first');
+  chord(app, 'keydown', 'KeyC', { ctrlKey: true });
+  chord(app, 'keyup', 'KeyC', { ctrlKey: true });
+  assert.deepEqual(inputBytes(app), [[1, 224]]);
+  complete({ ok: true });
+  await settle();
+  assert.deepEqual(inputBytes(app).slice(-2), [[1, 6], [2, 6]]);
+  pasteText(app, 'stale');
+  assert.deepEqual(posted, ['first']);
   clipboardNotice(app);
   await settle();
-  pasteText(app, 'stale');
+  assert.deepEqual(posted, ['first']);
+  assert.deepEqual(written, ['remote']);
+  assert.deepEqual(inputBytes(app).slice(-2), [[1, 25], [2, 25]]);
+});
+
+test('manual Push settles a waiting paste without waiting for the copy timer', async () => {
+  const { app, posted } = clipboardViewer('', undefined, { localRead: async () => 'host' });
   await settle();
+  chord(app, 'keydown', 'ControlLeft', { ctrlKey: true });
+  chord(app, 'keydown', 'KeyC', { ctrlKey: true });
+  chord(app, 'keyup', 'KeyC', { ctrlKey: true });
+  pasteText(app, 'host');
   assert.deepEqual(posted, []);
-  assert.deepEqual(inputBytes(app), [[1, 25], [2, 25]]);
+  const panel = clipboardAction(app, 'push');
+  await settle();
+  assert.deepEqual(posted, ['host', 'host']);
+  assert.deepEqual(inputBytes(app).slice(-2), [[1, 25], [2, 25]]);
+  assert.equal(panel.hidden, true);
+});
+
+test('a notice supersedes manual Pull without closing its panel and queues the newest host write', async () => {
+  let complete;
+  const started = [];
+  const { app, setRemote, written } = clipboardViewer('old', undefined, { write: async (text) => {
+    started.push(text);
+    if (text === 'old') await new Promise((resolve) => { complete = resolve; });
+  } });
+  await settle();
+  const panel = clipboardAction(app, 'pull');
+  await settle();
+  setRemote('new');
+  clipboardNotice(app);
+  await settle();
+  assert.deepEqual(started, ['old']);
+  complete();
+  await settle();
+  assert.deepEqual(written, ['old', 'new']);
+  assert.equal(panel.hidden, false);
+  assert.equal(app.document.querySelector('#status').textContent, 'Could not copy the remote clipboard');
 });
 
 test('a paste upload started before blur cannot replay a newer paste', async () => {

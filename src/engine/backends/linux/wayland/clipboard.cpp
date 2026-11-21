@@ -31,7 +31,7 @@ int remaining(Clock::time_point deadline) {
 /**
  * The clipboard selection of a wlroots compositor through wlr-data-control, on its own connection and thread.
  * A write offers the text as a data source that answers paste requests until another client takes the selection.
- * A read receives the selection through a pipe and gives up after two seconds. Each selection event is a change.
+ * A read receives the selection through a pipe and gives up after two seconds.
  * The selection ends with the engine, since a Wayland data source lives in its client.
  */
 class WaylandClipboard final : public ClipboardBackend {
@@ -82,11 +82,15 @@ class WaylandClipboard final : public ClipboardBackend {
     offers.erase(offer);
     zwlr_data_control_offer_v1_destroy(offer);
   }
+  static bool isOwnOffer(const std::vector<std::string>& types) {
+    return std::find(types.begin(), types.end(), ownType) != types.end();
+  }
   static void selectionChanged(void* data, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* offer) {
     auto* self = static_cast<WaylandClipboard*>(data);
     if (self->selection != offer) self->forget(self->selection);
     self->selection = offer;
-    self->changed();
+    const auto entry = self->offers.find(offer);
+    if (entry == self->offers.end() || !isOwnOffer(entry->second)) self->changed();
   }
   static void primarySelection(void* data, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* offer) {
     auto* self = static_cast<WaylandClipboard*>(data);
@@ -95,8 +99,11 @@ class WaylandClipboard final : public ClipboardBackend {
   static void deviceFinished(void* data, zwlr_data_control_device_v1*) {
     static_cast<WaylandClipboard*>(data)->broken = true;
   }
-  static void send(void* data, zwlr_data_control_source_v1*, const char*, int32_t fd) {
-    const std::string& text = static_cast<WaylandClipboard*>(data)->owned;
+  static void send(void* data, zwlr_data_control_source_v1*, const char* mime, int32_t fd) {
+    const std::string& owned = static_cast<WaylandClipboard*>(data)->owned;
+    const bool latin1 = std::strcmp(mime, "STRING") == 0;
+    const std::string converted = latin1 ? clipboard_detail::toLatin1(owned) : std::string();
+    const std::string& text = latin1 ? converted : owned;
     fcntl(fd, F_SETFL, O_NONBLOCK);
     const auto deadline = Clock::now() + std::chrono::seconds(2);
     for (size_t sent = 0; sent < text.size();) {
@@ -117,7 +124,7 @@ class WaylandClipboard final : public ClipboardBackend {
   std::optional<std::string> readHere() {
     if (!selection) return std::string();
     const auto& types = offers[selection];
-    if (std::find(types.begin(), types.end(), ownType) != types.end()) return owned;
+    if (isOwnOffer(types)) return owned;
     const char* chosen = nullptr;
     for (const char* type : textTypes) {
       if (std::find(types.begin(), types.end(), type) != types.end()) { chosen = type; break; }
