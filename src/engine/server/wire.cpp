@@ -103,11 +103,15 @@ ConnectionPlan connectionPlan(Socket socket, size_t viewerCount, bool streamOwns
 }
 bool frameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t lastSequence, const EncodedFrame& f,
                   uint16_t width, uint16_t height) {
-  if (!f.sequence || f.sequence != lastSequence + 1 || !f.width || !f.height ||
+  return frameMessage(out, pre, generation, lastSequence, f.sequence, f, width, height);
+}
+bool frameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t lastSequence, uint32_t sequence,
+                  const EncodedFrame& f, uint16_t width, uint16_t height) {
+  if (!sequence || sequence != lastSequence + 1 || !f.width || !f.height ||
       f.width > width || f.height > height || f.annex_b.empty() || f.annex_b.size() > FlowControl::max_bytes ||
       (!lastSequence && !f.keyframe)) return false;
   auto* p = start(out, pre, 32 + f.annex_b.size(), 1, generation);
-  put(p+6, f.keyframe ? 1 : 0, 2); put(p+12, f.sequence, 4);
+  put(p+6, f.keyframe ? 1 : 0, 2); put(p+12, sequence, 4);
   put(p+16, 12+f.annex_b.size(), 4); put(p+20, f.width, 2); put(p+22, f.height, 2); put(p+24, f.pts_us, 8);
   std::memcpy(p+32, f.annex_b.data(), f.annex_b.size());
   return true;

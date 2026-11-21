@@ -62,109 +62,87 @@ std::optional<FlowControl::TransportSample> streamTransportSample(lws* wsi, size
 }
 #endif
 }  // namespace
-Server::Stream::Stream(Server& server) : capture([this, &server](std::shared_ptr<const EncodedFrame> frame) {
-  std::lock_guard<std::mutex> lock(mutex);
-  if (!generation || frame->generation != generation) return false;
-  if (!flow.enqueue(frame->sequence, frame->annex_b.size(), frame->pts_us, nowUs())) {
-    failed = true; lws_cancel_service(server.context); return false;
-  }
-  pending.push_back(std::move(frame));
-  lws_cancel_service(server.context);
-  return true;
-}, CaptureSettings{server.config.fps, server.config.bitrate_min, server.config.bitrate_start, server.config.bitrate_max, server.config.encoder},
-backendFor(server.config.backend).capture, [this, &server](uint32_t gen, CursorImage&& cursor) {
-  std::lock_guard<std::mutex> lock(mutex);
-  if (!generation || gen != generation) return;
-  pending_cursor = std::move(cursor);
-  lws_cancel_service(server.context);
-}) {
-  const auto& cfg = server.config;
-  flow.configure(cfg.bitrate_min, cfg.bitrate_start, cfg.bitrate_max, cfg.fps);
-}
-void Server::Stream::begin(lws* wsi, uint32_t gen) {
-  viewer = wsi;
-#ifdef __linux__
-  configureStreamSocket(wsi);
-#endif
-  { std::lock_guard<std::mutex> lock(mutex); generation = gen; }
-  capture.beginSession(gen);
-}
-void Server::Stream::end() {
-  uint32_t old;
-  { std::lock_guard<std::mutex> lock(mutex); old = generation; generation = 0; pending.clear(); pending_cursor.reset(); flow.reset(); failed = false; }
-  last_write_cursor = false;
-  buffered_stream_bytes = 0; stream_notsent_lowat = 0; flow_timer_due_us = 0;
-  if (old) capture.endSession(old);
-  clipboard_notices = clipboard_pending = false;
-  lastSequence = 0; width = height = 0; received.clear(); viewer = nullptr;
-}
-Server::Server(Config settings) : config(std::move(settings)) {
-  streams[0] = std::make_unique<Stream>(*this);
-}
-Server::Stream* Server::streamFor(lws* wsi) {
-  for (auto& stream : streams) if (stream && stream->viewer == wsi) return stream.get();
+Server::Server(Config settings)
+    : config(std::move(settings)),
+      hub(CaptureSettings{config.fps, config.bitrate_min, config.bitrate_start, config.bitrate_max, config.encoder},
+          backendFor(config.backend).capture,
+          [w = wake] { w->cancel(); }) {}
+
+Server::ViewerSlot* Server::slotFor(lws* wsi) {
+  for (auto& slot : viewers) if (slot.viewer == wsi) return &slot;
   return nullptr;
 }
+
+bool Server::holdsInput() const {
+  return control || input_viewer;
+}
+
 ConnectionPlan Server::planConnection(Socket socket, bool grant) {
   size_t count = 0, grantCount = 0;
   bool inputViewerHasGrant = false;
-  for (const auto& stream : streams) {
-    if (!stream || !stream->viewer) continue;
+  for (const auto& slot : viewers) {
+    if (!slot.viewer) continue;
     ++count;
-    const auto* response = static_cast<HttpResponse*>(lws_wsi_user(stream->viewer));
+    const auto* response = static_cast<HttpResponse*>(lws_wsi_user(slot.viewer));
     const bool hasGrant = !response || response->grant_id;
     if (hasGrant) ++grantCount;
-    if (stream->viewer == input_viewer) inputViewerHasGrant = hasGrant;
+    if (slot.viewer == input_viewer) inputViewerHasGrant = hasGrant;
   }
-  return connectionPlan(socket, count, input_viewer != nullptr, control != nullptr, grantCount, grant, inputViewerHasGrant);
+  const bool stream_owns_input = input_viewer != nullptr;
+  return connectionPlan(socket, count, stream_owns_input, control != nullptr, grantCount, grant, inputViewerHasGrant);
 }
+
 int Server::startStream(lws* wsi, Socket socket, const ConnectionPlan& plan, bool clipboardNotices) {
-  auto slot = std::find_if(streams.begin(), streams.end(), [](const auto& stream) { return !stream || !stream->viewer; });
-  if (slot != streams.end() && !*slot) {
-    auto stream = std::make_unique<Stream>(*this);
-    std::string error;
-    if (!stream->capture.start(error)) {
-      std::cerr << "Viewer capture startup failed: " << error << '\n';
-      return -1;
-    }
-    *slot = std::move(stream);
-  }
   if (plan.closeStream) {
-    auto* previous = input_viewer;
-    evict(previous);
-    if (slot == streams.end()) {
-      slot = std::find_if(streams.begin(), streams.end(), [previous](const auto& stream) { return stream->viewer == previous; });
-      release(); input->cancel(); input_viewer = nullptr;
-      (*slot)->end();
-    } else endStream(previous);
+    if (input_viewer) {
+      auto* previous = input_viewer;
+      evict(previous);
+      endStream(previous);
+    }
   }
   if (plan.closeControl) { evict(control); endControl(); }
+  ViewerSlot* target = nullptr;
+  for (auto& slot : viewers) if (!slot.viewer) { target = &slot; break; }
+  if (!target) return -1;
+  const SubscriberRole role = socket == Socket::watch ? SubscriberRole::watch : SubscriberRole::controller;
+  auto sub = hub.attach(role, ++nextGeneration, clipboardNotices);
+  if (!sub) return -1;
+#ifdef __linux__
+  configureStreamSocket(wsi);
+#endif
   if (socket != Socket::watch) { input_viewer = wsi; input->resetLocks(); }
-  auto& stream = **slot;
-  stream.width = width; stream.height = height;
-  stream.clipboard_notices = clipboardNotices;
-  stream.begin(wsi, ++nextGeneration);
-  stream.updateFlow(config.proxy);
+  target->viewer = wsi;
+  target->sub = std::move(sub);
+  target->width = width;
+  target->height = height;
+  updateSlotFlow(*target);
   return 0;
 }
+
 void Server::release() { if (input) input->releaseAll(); }
+
 void Server::endStream(lws* wsi) {
-  for (auto slot = streams.begin(); slot != streams.end(); ++slot) {
-    if (!*slot || (*slot)->viewer != wsi) continue;
-    if (input_viewer == wsi) { release(); input->cancel(); input_viewer = nullptr; }
-    (*slot)->end();
-    if (slot != streams.begin()) slot->reset();
-    return;
+  auto* slot = slotFor(wsi);
+  if (!slot) return;
+  if (input_viewer == wsi) { release(); input->cancel(); input_viewer = nullptr; }
+  if (slot->sub) {
+    hub.detach(slot->sub->id);
+    slot->sub.reset();
   }
+  slot->viewer = nullptr;
+  slot->width = slot->height = 0;
 }
+
 void Server::endControl() {
   if (control) { release(); input->cancel(); }
   control_received.clear(); replies.clear(); control_ready = false; control_generation = 0; control = nullptr;
 }
+
 void Server::end() {
   endControl();
-  for (auto& stream : streams) if (stream && stream->viewer) endStream(stream->viewer);
+  for (auto& slot : viewers) if (slot.viewer) endStream(slot.viewer);
 }
+
 void Server::expireGrants() {
   const auto now = Grants::Clock::now();
   auto expired = [&](lws* wsi) {
@@ -172,9 +150,9 @@ void Server::expireGrants() {
     return response && response->grant_id && !grants.active(response->grant_id, now);
   };
   if (control && expired(control)) { evict(control, LWS_CLOSE_STATUS_POLICY_VIOLATION, "grant ended"); endControl(); }
-  for (auto& stream : streams) if (stream && stream->viewer && expired(stream->viewer)) {
-    evict(stream->viewer, LWS_CLOSE_STATUS_POLICY_VIOLATION, "grant ended");
-    endStream(stream->viewer);
+  for (auto& slot : viewers) if (slot.viewer && expired(slot.viewer)) {
+    evict(slot.viewer, LWS_CLOSE_STATUS_POLICY_VIOLATION, "grant ended");
+    endStream(slot.viewer);
   }
 }
 void Server::evict(lws* wsi, uint16_t code, const char* reason) {
@@ -201,93 +179,52 @@ bool Server::controlMessage() {
   input->fence(std::make_shared<ReplyFence>(wake, [reply](bool, size_t) { reply->ready.store(true, std::memory_order_release); }));
   lws_callback_on_writable(control); return true;
 }
-bool Server::streamMessage(Stream& stream) {
-  const auto& b = stream.received;
+bool Server::streamMessage(ViewerSlot& slot) {
+  if (!slot.sub) return false;
+  const auto& b = slot.sub->received;
   uint32_t gen = 0, seq = 0;
   if (!envelope(b, gen, seq)) return false;
   if (b[5] == 2) {
     if (b.size() != 20 && b.size() != 24) return false;
-    const uint64_t wait = FlowControl::ackWaitUs(b.data()+20, b.size()-20);
-    bool accepted = false;
-    { std::lock_guard<std::mutex> lock(stream.mutex);
-      if (gen == stream.generation && seq) accepted = stream.flow.ack(seq, nowUs(), wait);
-    }
-    if (accepted) { stream.capture.acknowledge(gen, seq); stream.updateFlow(config.proxy); }
+    const uint64_t wait = FlowControl::ackWaitUs(b.data() + 20, b.size() - 20);
+    if (hub.acknowledge(slot.sub, gen, seq, nowUs(), wait)) updateSlotFlow(slot);
     return true;
   }
-  if (b[5] != 3 || b.size() != 36 || seq || gen != stream.generation) return false;
-  if (input_viewer != stream.viewer) return true;
-  return input->apply(inputEvent(b.data()+20)) != InputStatus::invalid;
+  if (b[5] != 3 || b.size() != 36 || seq || gen != slot.sub->generation) return false;
+  if (input_viewer != slot.viewer) return true;
+  return input->apply(inputEvent(b.data() + 20)) != InputStatus::invalid;
 }
-void Server::Stream::updateFlow(bool proxy) {
-  if (viewer && !lws_partial_buffered(viewer)) buffered_stream_bytes = 0;
+
+void Server::updateSlotFlow(ViewerSlot& slot) {
+  if (!slot.viewer || !slot.sub) return;
+  if (!lws_partial_buffered(slot.viewer)) slot.sub->buffered_bytes = 0;
+  std::optional<FlowControl::TransportSample> sample;
 #ifdef __linux__
-  const auto sample = viewer && !proxy ? streamTransportSample(viewer, buffered_stream_bytes) : std::nullopt;
-  uint32_t notsent_lowat;
+  if (!config.proxy) sample = streamTransportSample(slot.viewer, slot.sub->buffered_bytes);
 #endif
-  uint32_t gen; unsigned window; uint64_t bitrate, admit_until, service_deadline; bool paused, inflight;
-  { std::lock_guard<std::mutex> lock(mutex);
-    const auto now = nowUs();
+  unsigned window = 1;
+  uint64_t deadline = 0;
+  uint32_t lowat = 0;
+  hub.updateFlow(slot.sub, nowUs(), sample, window, deadline, lowat);
+  (void)window;
 #ifdef __linux__
-    if (sample) flow.sampleTransport(*sample, now); else flow.clearTransport();
-#endif
-    flow.update(now);
-    gen = generation; window = flow.window; bitrate = flow.frameBitrate(); paused = flow.paused(now);
-    inflight = !flow.frames.empty();
-    admit_until = inflight && flow.transport_available ? flow.frames.front().captured_us + flow.transportAgeLimitUs() : 0;
-#ifdef __linux__
-    notsent_lowat = flow.notsentLowat();
-#endif
-    service_deadline = flow.serviceDeadlineUs(now, flow_timer_due_us);
-  }
-#ifdef __linux__
-  if (viewer && notsent_lowat != stream_notsent_lowat) {
-    const int fd = lws_get_socket_fd(viewer);
-    if (fd >= 0) (void)setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &notsent_lowat, sizeof(notsent_lowat));
-    stream_notsent_lowat = notsent_lowat;
+  if (lowat != slot.sub->notsent_lowat) {
+    const int fd = lws_get_socket_fd(slot.viewer);
+    if (fd >= 0) (void)setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+    slot.sub->notsent_lowat = lowat;
   }
 #endif
-  if (viewer && service_deadline != flow_timer_due_us) {
+  if (deadline != slot.sub->flow_timer_due_us) {
     const uint64_t now = nowUs();
-    lws_set_timer_usecs(viewer, service_deadline - std::min(service_deadline, now));
-    flow_timer_due_us = service_deadline;
+    lws_set_timer_usecs(slot.viewer, deadline - std::min(deadline, now));
+    slot.sub->flow_timer_due_us = deadline;
   }
-  // Never hold the transport mutex while calling the capture API. Publication takes it later.
-  capture.setFlowControl(gen, window, bitrate, paused, admit_until);
 }
-bool Server::Stream::timedOut() {
-  if (!capture.error().empty()) return true;
-  std::lock_guard<std::mutex> lock(mutex);
-  return failed || flow.timedOut(nowUs());
-}
+
 std::string Server::metrics() {
-  if (input_viewer) return streamFor(input_viewer)->metrics();
-  for (const auto& stream : streams) if (stream && stream->viewer) return stream->metrics();
-  return streams[0]->metrics();
+  return hub.primaryMetrics(nowUs());
 }
-std::string Server::Stream::metrics() {
-  std::lock_guard<std::mutex> lock(mutex);
-  return ",\"inflight_frames\":" + std::to_string(flow.frames.size()) +
-      ",\"inflight_bytes\":" + std::to_string(flow.bytes) +
-      ",\"window_frames\":" + std::to_string(flow.window) +
-      ",\"target_bitrate_bps\":" + std::to_string(flow.target_bitrate) +
-      ",\"min_rtt_ms\":" + std::to_string(flow.transport.min_rtt_us / 1000.0) +
-      ",\"delivery_rate_bps\":" + std::to_string(flow.delivery_rate_bps) +
-      ",\"notsent_bytes\":" + std::to_string(flow.transport.notsent_bytes) +
-      ",\"sender_queue_ms\":" + std::to_string(flow.senderQueueUs() / 1000.0) +
-      ",\"retrans\":" + std::to_string(flow.transport.total_retrans) +
-      ",\"ack_rtt_ms\":" + std::to_string(flow.ack_rtt_us / 1000.0) +
-      ",\"oldest_frame_ms\":" + std::to_string(flow.oldestAge(nowUs()) / 1000.0) +
-      ",\"frames_acked\":" + std::to_string(flow.acknowledged) +
-      ",\"frames_encoded\":" + std::to_string(flow.encoded) +
-      ",\"observed_busy_goodput_bps\":" + std::to_string(flow.goodput_bps) +
-      ",\"max_inflight_frames\":" + std::to_string(flow.frameLimit()) +
-      ",\"max_inflight_bytes\":" + std::to_string(FlowControl::max_bytes) +
-      ",\"max_frame_bytes\":" + std::to_string(FlowControl::max_bytes) +
-      ",\"admission_age_ms\":" + std::to_string(flow.admissionAgeUs() / 1000.0) +
-      ",\"no_ack_timeout_ms\":" + std::to_string(FlowControl::timeout_us / 1000) +
-      ",\"max_frame_age_ms\":" + std::to_string(FlowControl::timeout_us / 1000);
-}
+
 int Server::writeControl(lws* wsi) {
   if (!control_ready && (replies.empty() || !replies.front()->ready.load(std::memory_order_acquire))) return 0;
   std::vector<uint8_t> wire;
@@ -343,52 +280,46 @@ void Server::forgetInput(lws* wsi) {
   input_replies.erase(std::remove_if(input_replies.begin(), input_replies.end(),
       [wsi](const std::shared_ptr<InputReply>& reply) { return reply->wsi == wsi; }), input_replies.end());
 }
-int Server::Stream::write(bool proxy) {
-  auto* wsi = viewer;
-  updateFlow(proxy);
-  std::shared_ptr<const EncodedFrame> frame;
-  std::optional<CursorImage> cursor;
+int Server::writeSlot(ViewerSlot& slot) {
+  auto* wsi = slot.viewer;
+  if (!wsi || !slot.sub) return -1;
+  updateSlotFlow(slot);
   std::vector<uint8_t> wire;
-  if (lastSequence && clipboard_pending) {
-    clipboardNotice(wire, LWS_PRE, generation);
+  if (slot.sub->last_sent_sequence && slot.sub->clipboard_pending) {
+    clipboardNotice(wire, LWS_PRE, slot.sub->generation);
     const size_t size = wire.size() - LWS_PRE;
     if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
-    clipboard_pending = false;
+    slot.sub->clipboard_pending = false;
     lws_callback_on_writable(wsi);
     return 0;
   }
-  { std::lock_guard<std::mutex> lock(mutex);
-    if (failed) return -1;
-    if (lastSequence && pending_cursor && (!last_write_cursor || pending.empty())) {
-      cursor = std::move(pending_cursor); pending_cursor.reset();
-    } else {
-      if (pending.empty()) return 0;
-      frame = std::move(pending.front()); pending.pop_front();
-    }
+  std::optional<ViewerPacket> packet;
+  std::optional<CursorImage> cursor;
+  bool failed = false, more_pending = false;
+  if (!hub.popOutbound(slot.sub, packet, cursor, failed, more_pending)) {
+    return failed ? -1 : 0;
   }
   if (cursor) {
-    if (!cursorMessage(wire, LWS_PRE, generation, *cursor)) return -1;
+    if (!cursorMessage(wire, LWS_PRE, slot.sub->generation, *cursor)) return -1;
     const size_t size = wire.size() - LWS_PRE;
     if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
-    buffered_stream_bytes = lws_partial_buffered(wsi) ? size : 0;
-    last_write_cursor = true;
-    updateFlow(proxy);
-    { std::lock_guard<std::mutex> lock(mutex);
-      if (!pending.empty() || pending_cursor) lws_callback_on_writable(wsi);
-    }
+    slot.sub->buffered_bytes = lws_partial_buffered(wsi) ? size : 0;
+    updateSlotFlow(slot);
+    if (more_pending || slot.sub->clipboard_pending) lws_callback_on_writable(wsi);
     return 0;
   }
-  const auto& f = *frame;
-  if (f.generation != generation) return 0;
-  if (!frameMessage(wire, LWS_PRE, generation, lastSequence, f, width, height)) return -1;
+  const auto& f = *packet->frame;
+  if (!frameMessage(wire, LWS_PRE, slot.sub->generation, slot.sub->last_sent_sequence,
+                    packet->sequence, f, slot.width, slot.height)) return -1;
   const size_t size = wire.size() - LWS_PRE;
   if (lws_write(wsi, wire.data() + LWS_PRE, size, LWS_WRITE_BINARY) != int(size)) return -1;
-  buffered_stream_bytes = lws_partial_buffered(wsi) ? size : 0;
-  width = f.width; height = f.height; lastSequence = f.sequence;
-  last_write_cursor = false;
-  { std::lock_guard<std::mutex> lock(mutex); if (!flow.sent(f.sequence, nowUs())) return -1; }
-  updateFlow(proxy);
-  { std::lock_guard<std::mutex> lock(mutex); if (!pending.empty() || pending_cursor) lws_callback_on_writable(wsi); }
+  slot.sub->buffered_bytes = lws_partial_buffered(wsi) ? size : 0;
+  slot.width = f.width;
+  slot.height = f.height;
+  slot.sub->last_sent_sequence = packet->sequence;
+  if (!hub.markSent(slot.sub, packet->sequence, nowUs())) return -1;
+  updateSlotFlow(slot);
+  if (more_pending || slot.sub->clipboard_pending) lws_callback_on_writable(wsi);
   return 0;
 }
 namespace {
@@ -584,7 +515,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
           lws_set_timer_usecs(wsi, 5000000); return 0;
         }
         const std::string backend = s->input->name();
-        const auto stats = s->streams[0]->capture.stats();
+        const auto stats = s->hub.stats();
         const std::string json = "{\"version\":1,\"backend\":\"" + backend +
             "\",\"width\":" + std::to_string(s->width) + ",\"height\":" + std::to_string(s->height) +
             ",\"fps\":" + std::to_string(s->config.fps) +
@@ -640,11 +571,11 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         closeScreenshot(s, wsi, response); return completeResponse(wsi, response);
       }
       if (!response->length) return 0;
-      unsigned char buffer[LWS_PRE+2048];
-      std::memcpy(buffer+LWS_PRE, response->body, response->length);
+      unsigned char buffer[LWS_PRE + sizeof(response->body)];
+      std::memcpy(buffer + LWS_PRE, response->body, response->length);
       const size_t count = response->length;
       response->length = 0;
-      if (lws_write(wsi, buffer+LWS_PRE, count, LWS_WRITE_HTTP_FINAL) != int(count)) return -1;
+      if (lws_write(wsi, buffer + LWS_PRE, count, LWS_WRITE_HTTP_FINAL) != int(count)) return -1;
       return completeResponse(wsi, response);
     }
     case LWS_CALLBACK_HTTP_BODY: {
@@ -728,14 +659,14 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       if (s->closing.count(wsi)) return 0;
       if (const auto* response = static_cast<HttpResponse*>(user); response && response->grant_id &&
           !s->grants.active(response->grant_id, Grants::Clock::now())) { s->expireGrants(); return 0; }
-      auto* stream = s->streamFor(wsi);
-      if (!stream && s->control != wsi) return -1;
-      auto& received = stream ? stream->received : s->control_received;
-      if (!lws_frame_is_binary(wsi) || len > 65536-received.size()) return -1;
-      received.insert(received.end(), static_cast<uint8_t*>(in), static_cast<uint8_t*>(in)+len);
+      auto* slot = s->slotFor(wsi);
+      if (!slot && s->control != wsi) return -1;
+      auto& received = slot ? slot->sub->received : s->control_received;
+      if (!lws_frame_is_binary(wsi) || len > 65536 - received.size()) return -1;
+      received.insert(received.end(), static_cast<uint8_t*>(in), static_cast<uint8_t*>(in) + len);
       if (received.size() > 36) return -1;
       if (lws_is_final_fragment(wsi) && !lws_remaining_packet_payload(wsi)) {
-        if (!(stream ? s->streamMessage(*stream) : s->controlMessage())) return -1;
+        if (!(slot ? s->streamMessage(*slot) : s->controlMessage())) return -1;
         received.clear();
       }
       return 0;
@@ -744,17 +675,17 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       if (s->closing.count(wsi)) return 0;
       if (const auto* response = static_cast<HttpResponse*>(user); response && response->grant_id &&
           !s->grants.active(response->grant_id, Grants::Clock::now())) { s->expireGrants(); return 0; }
-      if (auto* stream = s->streamFor(wsi)) {
-        const int result = stream->write(s->config.proxy);
-        if (stream->width) { s->width = stream->width; s->height = stream->height; }
+      if (auto* slot = s->slotFor(wsi)) {
+        const int result = s->writeSlot(*slot);
+        if (slot->width) { s->width = slot->width; s->height = slot->height; }
         return result;
       }
       return s->control == wsi ? s->writeControl(wsi) : -1;
     }
     case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
-      for (const auto& stream : s->streams) if (stream && stream->viewer) {
-        stream->updateFlow(s->config.proxy);
-        lws_callback_on_writable(stream->viewer);
+      for (auto& slot : s->viewers) if (slot.viewer) {
+        s->updateSlotFlow(slot);
+        lws_callback_on_writable(slot.viewer);
       }
       if (s->control) lws_callback_on_writable(s->control);
       for (const auto& reply : s->readyInputs()) {
@@ -767,10 +698,10 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         lws_callback_on_writable(reply->wsi);
       }
       if (s->clipboard_changed.exchange(false) && s->input_viewer) {
-        auto* stream = s->streamFor(s->input_viewer);
-        if (stream && stream->clipboard_notices) {
-          stream->clipboard_pending = true;
-          lws_callback_on_writable(stream->viewer);
+        auto* slot = s->slotFor(s->input_viewer);
+        if (slot && slot->sub && slot->sub->clipboard_notices) {
+          slot->sub->clipboard_pending = true;
+          lws_callback_on_writable(slot->viewer);
         }
       }
       for (auto& reply : s->clipboard.take()) {
@@ -801,12 +732,12 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
     case LWS_CALLBACK_TIMER:
       if (s->closing.erase(wsi)) return -1;
       if (s->screenshot_client == wsi) { closeScreenshot(s, wsi, static_cast<HttpResponse*>(user)); return -1; }
-      if (auto* stream = s->streamFor(wsi)) {
-        stream->flow_timer_due_us = 0;
-        if (stream->timedOut()) {
+      if (auto* slot = s->slotFor(wsi)) {
+        slot->sub->flow_timer_due_us = 0;
+        if (s->hub.timedOut(slot->sub, nowUs())) {
           std::cerr << "Viewer capture or flow failed\n"; s->endStream(wsi); return -1;
         }
-        stream->updateFlow(s->config.proxy);
+        s->updateSlotFlow(*slot);
         return 0;
       }
       return -1;

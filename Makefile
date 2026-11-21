@@ -52,7 +52,7 @@ ENGINE_SRCS = $(CORE_SRCS) $(wildcard src/engine/server/*.cpp) $(BACKEND_SRCS)
 HEADERS = $(wildcard src/engine/*/*.hpp src/engine/backends/linux/*.hpp) $(foreach dir,$(BACKEND_DIRS),$(wildcard src/engine/backends/$(dir)/*.hpp))
 
 WAYLAND_PROTOCOLS = wlr-data-control-unstable-v1 wlr-screencopy-unstable-v1 wlr-virtual-pointer-unstable-v1 virtual-keyboard-unstable-v1
-.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-backend test-server test-keymap test-macos-keys clean FORCE
+.PHONY: all deps install test test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-stream-hub test-backend test-server test-keymap test-macos-keys clean FORCE
 all: relay-engine
 
 ifeq ($(HAS_WAYLAND),wayland)
@@ -140,6 +140,13 @@ build/encoder-state-test: tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCOD
 test-encoder-state: build/encoder-state-test
 	./build/encoder-state-test
 
+build/stream-hub-test: tests/unit/stream-hub-test.cpp src/engine/server/stream-hub.cpp src/engine/server/stream-hub.hpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
+	mkdir -p build
+	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/stream-hub-test.cpp src/engine/server/stream-hub.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS)) $(ENCODER_PLATFORM_LIBS)
+
+test-stream-hub: build/stream-hub-test
+	./build/stream-hub-test
+
 build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
 	mkdir -p build
 	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale) $(ENCODER_PLATFORM_LIBS)
@@ -175,7 +182,7 @@ build/macos-keys-test: tests/unit/macos-keys-test.cpp src/engine/backends/macos/
 test-macos-keys: build/macos-keys-test
 	./build/macos-keys-test
 
-test: test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
+test: test-color test-flow test-capture-bucket test-cpu-budget test-input test-encoder-state test-stream-hub test-backend test-server $(if $(HAS_WAYLAND),test-keymap) $(if $(filter macos,$(BACKENDS)),test-macos-keys)
 
 clean:
 	rm -rf build relay-engine
