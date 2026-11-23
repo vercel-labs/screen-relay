@@ -653,6 +653,15 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
           response->grant_id = grant->id;
           if (grant->scope == GrantScope::watch) requested_socket = Socket::watch;
         }
+        if (lws_hdr_fragment_length(wsi, WSI_TOKEN_HTTP_URI_ARGS, 0) > 0) {
+          char arg[8] = {};
+          const int length = lws_hdr_copy_fragment(wsi, arg, sizeof(arg), WSI_TOKEN_HTTP_URI_ARGS, 0);
+          if (length < 0 || std::string(arg, size_t(length)) != "view=1" ||
+              lws_hdr_fragment_length(wsi, WSI_TOKEN_HTTP_URI_ARGS, 1) > 0) {
+            return errorResponse(wsi, response, HTTP_STATUS_BAD_REQUEST, "invalid_query");
+          }
+          requested_socket = Socket::watch;
+        }
         if (s->rtc.hasOffer()) {
           return errorResponse(wsi, response, HTTP_STATUS_CONFLICT, "busy");
         }
