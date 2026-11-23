@@ -287,7 +287,6 @@ void StreamHub::detach(uint64_t subscriber_id) {
 }
 
 bool StreamHub::onFrame(std::shared_ptr<const EncodedFrame> frame) {
-  bool request_idr = false;
   bool ack_now = false;
   uint32_t ack_gen = 0, ack_seq = 0;
   uint32_t flow_gen = 0;
@@ -345,12 +344,6 @@ bool StreamHub::onFrame(std::shared_ptr<const EncodedFrame> frame) {
           dropUnsentLocked(*sub);
           sub->state = ViewerState::awaiting_idr;
           sub->awaiting_idr_since_us = now;
-          if (now - std::min(now, last_non_controller_idr_us_) >= 2000000 &&
-              now - std::min(now, sub->keyframe_requested_us) >= 2000000) {
-            sub->keyframe_requested_us = now;
-            last_non_controller_idr_us_ = now;
-            request_idr = true;
-          }
         }
         continue;
       }
@@ -374,7 +367,6 @@ bool StreamHub::onFrame(std::shared_ptr<const EncodedFrame> frame) {
   for (const auto& [sink, generation, sequence] : rtc_deliveries) sink(frame, generation, sequence);
   if (ack_now) capture_.acknowledge(ack_gen, ack_seq);
   if (push_flow) capture_.setFlowControl(flow_gen, window, bitrate, paused, admit_until);
-  if (request_idr) capture_.requestKeyframe();
   if (notify_ws && wake_) wake_();
   return true;
 }
@@ -424,7 +416,7 @@ void StreamHub::updateFlow(const std::shared_ptr<Subscriber>& sub, uint64_t now_
   uint32_t ack_enc_gen = 0, ack_enc_seq = 0;
   unsigned window = 1;
   uint64_t bitrate = settings_.start_bitrate, admit_until = 0;
-  bool paused = false, push_flow = false;
+  bool paused = false, push_flow = false, request_idr = false;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -443,6 +435,13 @@ void StreamHub::updateFlow(const std::shared_ptr<Subscriber>& sub, uint64_t now_
     if (sub->state == ViewerState::awaiting_idr && sub->awaiting_idr_since_us) {
       const uint64_t idr_due = sub->awaiting_idr_since_us + FlowControl::timeout_us;
       out_deadline_us = out_deadline_us ? std::min(out_deadline_us, idr_due) : idr_due;
+      if (sub->keyframe_requested_us < sub->awaiting_idr_since_us &&
+          now_us - std::min(now_us, last_non_controller_idr_us_) >= 2000000 &&
+          now_us - std::min(now_us, sub->keyframe_requested_us) >= 2000000) {
+        sub->keyframe_requested_us = now_us;
+        last_non_controller_idr_us_ = now_us;
+        request_idr = true;
+      }
     }
     const uint64_t next_driver = driverIdLocked(now_us);
     if (next_driver != active_driver_id_) {
@@ -467,6 +466,7 @@ void StreamHub::updateFlow(const std::shared_ptr<Subscriber>& sub, uint64_t now_
   if (push_flow) {
     capture_.setFlowControl(enc_gen, window, bitrate, paused, admit_until);
   }
+  if (request_idr) capture_.requestKeyframe();
 }
 
 bool StreamHub::acknowledge(const std::shared_ptr<Subscriber>& sub, uint32_t viewer_generation, uint32_t sequence,

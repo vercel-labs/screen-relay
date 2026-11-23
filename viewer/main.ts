@@ -127,7 +127,7 @@ type ClipboardState = { state: 'local'; copy?: boolean } | { state: 'copy-pendin
   | { state: 'remote-pending'; copy: boolean } | { state: 'remote-unavailable' };
 type PasteState = { state: 'idle' } | {
   state: 'waiting' | 'sending'; key: number; buttons: number; modifiers: number;
-  source: 'local' | 'remote'; revision: number; queue: Uint8Array[];
+  source: 'local' | 'remote'; revision: number; queue: InputEvent[];
 };
 let paste: PasteState = { state: 'idle' }, clipboardAvailable = false;
 const MAX_PASTE_INPUT = 256;
@@ -188,13 +188,13 @@ function expectRemoteCopy() {
 function finishPaste(current: Exclude<PasteState, { state: 'idle' }>, replay: boolean) {
   if (paste !== current) return;
   paste = { state: 'idle' };
-  if (!ready || socket?.readyState !== WebSocket.OPEN || viewOnly) return;
+  if (!inputOpen() || viewOnly) return;
   if (replay) {
     const { key, buttons, modifiers } = current;
-    socket.send(encodeInput({ type: 'keyDown', key, buttons, modifiers }, generation, 0));
-    socket.send(encodeInput({ type: 'keyUp', key, buttons, modifiers }, generation, 0));
+    transmit({ type: 'keyDown', key, buttons, modifiers });
+    transmit({ type: 'keyUp', key, buttons, modifiers });
   }
-  for (const input of current.queue) socket.send(input);
+  for (const record of current.queue) transmit(record);
   if (!replay) setStatus('Could not send the clipboard');
 }
 function holdBackPaste(e: KeyboardEvent, key: number): boolean {
@@ -223,16 +223,20 @@ document.addEventListener('paste', (e) => {
   else send();
 });
 
+/** True while the transport carrying the stream can take input. */
+function inputOpen(): boolean {
+  return isRtcActive() ? channel?.readyState === 'open' : ready && socket?.readyState === WebSocket.OPEN;
+}
+/** Sends one input record, with its button and modifier masks set, on the transport carrying the stream. */
+function transmit(record: InputEvent) {
+  if (isRtcActive()) channel!.send(encodeInputRecord(record) as Uint8Array<ArrayBuffer>);
+  else socket.send(encodeInput(record, generation, 0));
+}
 function sendInput(event: InputEvent): boolean {
-  if (isRtcActive()) {
-    if (channel?.readyState !== 'open' || (viewOnly && event.type !== 'releaseAll')) return false;
-    channel.send(encodeInputRecord({ ...event, buttons, modifiers }) as Uint8Array<ArrayBuffer>);
-    return true;
-  }
-  if (!ready || socket?.readyState !== WebSocket.OPEN || (viewOnly && event.type !== 'releaseAll')) return false;
-  const input = encodeInput({ ...event, buttons, modifiers }, generation, 0);
-  if (paste.state === 'idle') socket.send(input);
-  else if (paste.queue.length < MAX_PASTE_INPUT) paste.queue.push(input);
+  if (!inputOpen() || (viewOnly && event.type !== 'releaseAll')) return false;
+  const record: InputEvent = { ...event, buttons, modifiers };
+  if (paste.state === 'idle') transmit(record);
+  else if (paste.queue.length < MAX_PASTE_INPUT) paste.queue.push(record);
   else { release(); setStatus('Paste cancelled · too much input queued'); return false; }
   return true;
 }
@@ -617,9 +621,6 @@ function fallbackToWs(reason: string) {
   fellBackToWs = true;
   fellBackToReason = reason;
   epoch++;
-  endRtc();
-  video.hidden = true;
-  canvas.hidden = false;
   transport = { state: 'rtc-fallback-ws', reason };
   reset();
   connectWs();
@@ -811,6 +812,9 @@ function connect() {
   connectWs();
 }
 function connectWs() {
+  endRtc();
+  video.hidden = true;
+  canvas.hidden = false;
   if (reconnectMode === 'grant-ended') return;
   reconnectMode = 'automatic';
   clearTimeout(retryTimer);
