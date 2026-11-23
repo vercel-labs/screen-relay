@@ -1,4 +1,5 @@
 #include "core/capture-source.hpp"
+#include "core/image-scale.hpp"
 #include "core/wait.hpp"
 #include "backends/macos/display.hpp"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -128,7 +129,7 @@ struct CaptureState {
   std::condition_variable arrived;
   std::vector<uint8_t> image;
   std::vector<MacCapture*> sources;
-  bool haveFrame = false;
+  bool haveFrame = false, placeholder = false;
   std::string failure;
   SCStream* stream = nil;
   std::atomic<uint64_t> epoch{0};
@@ -366,8 +367,14 @@ void CaptureState::reconfigure(const Display& now) {
   staleWidth = display.width;
   staleHeight = display.height;
   display = now;
-  image.assign(size_t(now.width) * now.height * 4, 0);
-  haveFrame = false;
+  std::vector<uint8_t> resized(size_t(now.width) * now.height * 4, 0);
+  if (haveFrame) {
+    RgbaScaleTable table;
+    table.build(staleWidth, staleHeight, now.width, now.height);
+    scaleRgbaRect(image.data(), staleWidth * 4, table, resized.data(), now.width * 4, {0, 0, now.width, now.height});
+  }
+  image.swap(resized);
+  placeholder = haveFrame;
   ++epoch;
   for (auto* source : sources) source->damaged({}, true);
 }
@@ -403,7 +410,8 @@ void CaptureState::frame(CMSampleBufferRef sample) {
     throw std::runtime_error("Screen capture returned an invalid image stride");
   std::lock_guard<std::mutex> lock(mutex);
   if (!failure.empty()) return;
-  full = full || !haveFrame;
+  full = full || !haveFrame || placeholder;
+  placeholder = false;
   if (full) rects = {{0, 0, display.width, display.height}};
   for (const auto& rect : rects)
     for (int y = rect.y; y < rect.y + rect.height; ++y)

@@ -165,6 +165,12 @@ static void sourceResize() {
           resized.width == 1920 && resized.height == 1080, "new generation did not start with a keyframe at the new size");
   decodedPixel(resized, false, 1920, 1080);
   encoder.acknowledge(18, 1);
+  std::this_thread::sleep_for(2500ms);
+  require(encoder.error().empty(), "idle source after a resize ended the worker");
+  state->red = true; state->damage();
+  const auto idle = frames.at(2);
+  require(idle.generation == 18 && idle.sequence == 2 && !idle.keyframe, "session did not survive a quiet source after a resize");
+  encoder.acknowledge(18, 2);
   state->width = 200; state->damage();
   for (int i = 0; i < 300 && encoder.error().empty(); ++i) std::this_thread::sleep_for(10ms);
   require(encoder.error().find("Unsupported root size 200x1080") != std::string::npos,
