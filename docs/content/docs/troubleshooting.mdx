@@ -94,8 +94,7 @@ To confirm, compare the frame rate in the viewer's **Stream statistics**, which 
 | Symptom | Cause and fix |
 | --- | --- |
 | `Screen capture permission is missing` or `Accessibility permission is missing` | Enable **Screen & System Audio Recording** and **Accessibility** under **System Settings > Privacy & Security** for the app that starts screen-relay, such as your terminal. Restart that app, then run `screen-relay doctor`. See [macOS](/docs/macos#grant-permissions). |
-| `Display N not found; active displays:` | Pass an ID from the list in the error with `--output`. See [macOS](/docs/macos#choose-a-display). |
-| `The display changed ... restart screen-relay to stream it` | The display's size or position changed. Run `screen-relay up` again. |
+| `Display N not found; active displays:` | Pass an ID from the list in the error with `--output`. The same error ends a running stream when the display you chose is unplugged. Reconnect it, then run `screen-relay up` again. See [macOS](/docs/macos#choose-a-display). |
 
 ## Wayland
 

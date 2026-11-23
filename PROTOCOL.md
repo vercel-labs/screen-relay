@@ -87,7 +87,7 @@ Every message starts with this 20-byte header.
 | 4 | 1 byte | Version: `1`. |
 | 5 | 1 byte | Message type from the table below. |
 | 6 | 2 bytes | Flags: zero except frame bit 0, which marks a keyframe. |
-| 8 | 4 bytes | Nonzero generation, incremented for each connection. |
+| 8 | 4 bytes | Nonzero generation, incremented for each connection and when the desktop size changes. The first frame of a generation is a keyframe with sequence 1. |
 | 12 | 4 bytes | Sequence; meaning depends on message type. |
 | 16 | 4 bytes | Payload length in bytes. |
 

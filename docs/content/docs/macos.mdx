@@ -70,7 +70,9 @@ To list the IDs, pass one that does not exist, such as `--output 0`. The engine 
 - The stream uses the display's native pixels when they fit H.264 Level 5.2 at `stream.fps` (up to 4096 pixels per axis). Larger displays, such as 5K, 6K, or scaled HiDPI backing stores, scale down proportionally so ordinary browser decoders can decode the stream.
 - The pointer is not part of the video. The viewer shows the browser's own pointer.
 - The frame rate follows the display's refresh rate, up to `stream.fps`. The setting accepts up to 120.
-- If the display's size or position changes, the stream stops with `The display changed from WxH to WxH or moved; restart screen-relay to stream it`. Run `screen-relay up` again.
+- The stream follows the display when its resolution or scale changes, when you plug in or remove a monitor, and when you open or close the lid. The viewer redraws at the new size within a moment. The new size obeys the same H.264 Level 5.2 limits as the first one.
+- Without `--output`, screen-relay follows the main display, so it switches to a new main display. With `--output`, it streams that display only. If you unplug it, the stream stops with `Display N not found` and the list of online displays. Plug it back in and run `screen-relay up` again.
+- Moving a display in System Settings changes where the pointer lands, and does not interrupt the stream.
 - Text is typed as Unicode characters.
 
 ## Check the machine

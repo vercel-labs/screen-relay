@@ -223,12 +223,14 @@ struct Resources {
 }  // namespace
 
 struct CaptureEncoder::Impl {
-  explicit Impl(Publish callback, CaptureSettings options, CaptureSourceFactory factory, PublishCursor cursor)
+  explicit Impl(Publish callback, CaptureSettings options, CaptureSourceFactory factory, PublishCursor cursor,
+                Resized resized)
       : source_factory(std::move(factory)), publish(std::move(callback)), publish_cursor(std::move(cursor)),
-        settings(options) {}
+        resized(std::move(resized)), settings(options) {}
   CaptureSourceFactory source_factory;
   Publish publish;
   PublishCursor publish_cursor;
+  Resized resized;
   CaptureSettings settings;
   mutable std::mutex mutex;
   std::condition_variable ready;
@@ -248,28 +250,37 @@ struct CaptureEncoder::Impl {
   void wake() { wake_event.signal(); }
   void run() {
     try {
-      auto source = source_factory();
-      require(bool(source), "capture source factory returned null");
-      require(validWaitHandle(source->fd()), "invalid capture source fd");
-      const auto format = source->pixelFormat();
-      require(format == PixelFormat::BGRA || format == PixelFormat::ARGB, "unsupported capture pixel format");
-      SurfacePlan plan;
-      source = fitCaptureSourceToBudget(std::move(source), settings.fps, &plan);
-      if (plan.scaled()) {
-        std::fprintf(stderr, "capture: scaling %dx%d to %dx%d (%s, H.264 level %u.%u at %u fps)\n",
-                     plan.source_width, plan.source_height, plan.stream_width, plan.stream_height,
-                     surfaceFitStateName(plan.state), unsigned(plan.h264_level_idc / 10),
-                     unsigned(plan.h264_level_idc % 10), settings.fps);
-      }
-      const auto dimensions = source->dimensions();
-      const int width = dimensions.first, height = dimensions.second;
-      requireSurfaceSize(width, height);
-      Resources r(format, width, height, settings);
-      r.init();
-      { std::lock_guard<std::mutex> lock(mutex);
+      std::unique_ptr<CaptureSource> source;
+      std::unique_ptr<Resources> resources;
+      int width = 0, height = 0;
+      auto open = [&] {
+        auto next = source_factory();
+        require(bool(next), "capture source factory returned null");
+        require(validWaitHandle(next->fd()), "invalid capture source fd");
+        const auto format = next->pixelFormat();
+        require(format == PixelFormat::BGRA || format == PixelFormat::ARGB, "unsupported capture pixel format");
+        SurfacePlan plan;
+        next = fitCaptureSourceToBudget(std::move(next), settings.fps, &plan);
+        if (plan.scaled()) {
+          std::fprintf(stderr, "capture: scaling %dx%d to %dx%d (%s, H.264 level %u.%u at %u fps)\n",
+                       plan.source_width, plan.source_height, plan.stream_width, plan.stream_height,
+                       surfaceFitStateName(plan.state), unsigned(plan.h264_level_idc / 10),
+                       unsigned(plan.h264_level_idc % 10), settings.fps);
+        }
+        const auto dimensions = next->dimensions();
+        requireSurfaceSize(dimensions.first, dimensions.second);
+        auto opened = std::make_unique<Resources>(format, dimensions.first, dimensions.second, settings);
+        opened->init();
+        resources = std::move(opened);
+        source = std::move(next);
+        width = dimensions.first; height = dimensions.second;
+        std::lock_guard<std::mutex> lock(mutex);
         stream_width = width; stream_height = height;
-        counters.cursor_supported = source->cursorSupported(); initialized = true; running = true;
-      }
+        counters.cursor_supported = source->cursorSupported();
+      };
+      open();
+      auto& r = resources;
+      { std::lock_guard<std::mutex> lock(mutex); initialized = true; running = true; }
       ready.notify_all();
       bool dirty = true, force_idr = true;
       uint64_t seen_revision = 0;
@@ -293,6 +304,16 @@ struct CaptureEncoder::Impl {
         first_refinement_size = 0;
       };
       while (true) {
+        if (source->resized()) {
+          open();
+          { std::lock_guard<std::mutex> lock(mutex); active = false; }
+          dirty = true; force_idr = true;
+          reset_refinement();
+          retry_after = Clock::time_point::min();
+          consecutive_failures = 0;
+          if (resized) resized();
+          continue;
+        }
         if (source->drainDamage()) dirty = true;
         uint32_t gen, seq;
         uint64_t rev, rate;
@@ -344,16 +365,16 @@ struct CaptureEncoder::Impl {
                       view.stride >= view.width * 4 && view.stride <= width * 8 &&
                       !(view.x & 1) && !(view.y & 1) && !(view.width & 1) && !(view.height & 1) &&
                       !(force_idr && (view.width != width || view.height != height)) &&
-                      view.format == r.format, "invalid capture frame");
+                      view.format == r->format, "invalid capture frame");
               bool changed = true;
               if (force_idr) {
                 const auto convert = view.format == PixelFormat::BGRA ? bgraToNv12 : argbToNv12;
-                require(convert(view.data, view.stride, r.frame.img.plane[0], r.frame.img.i_stride[0],
-                                r.frame.img.plane[1], r.frame.img.i_stride[1], view.width, view.height),
+                require(convert(view.data, view.stride, r->frame.img.plane[0], r->frame.img.i_stride[0],
+                                r->frame.img.plane[1], r->frame.img.i_stride[1], view.width, view.height),
                         "RGB conversion failed");
               } else {
                 if (!source->changedRects(rects)) rects = {{view.x, view.y, view.width, view.height}};
-                changed = r.convertDamage(view, rects);
+                changed = r->convertDamage(view, rects);
               }
               converted = Clock::now();
               if (!changed) {
@@ -372,24 +393,24 @@ struct CaptureEncoder::Impl {
               }
             }
             const int64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(capture_start.time_since_epoch()).count();
-            r.frame.i_pts = last_pts = std::max(last_pts + 1, timestamp);
+            r->frame.i_pts = last_pts = std::max(last_pts + 1, timestamp);
             const bool wide_vbv = refinement || force_idr;
-            if (rate != r.bitrate || wide_vbv != r.wide_vbv) {
+            if (rate != r->bitrate || wide_vbv != r->wide_vbv) {
               x264_param_t params;
-              x264_encoder_parameters(r.codec, &params);
+              x264_encoder_parameters(r->codec, &params);
               params.rc.i_vbv_max_bitrate = int(rate / 1000);
               params.rc.i_vbv_buffer_size = vbvBufferKbit(rate, settings.fps, wide_vbv);
-              require(x264_encoder_reconfig(r.codec, &params) == 0, "encoder reconfiguration failed");
-              r.bitrate = rate;
-              r.wide_vbv = wide_vbv;
+              require(x264_encoder_reconfig(r->codec, &params) == 0, "encoder reconfiguration failed");
+              r->bitrate = rate;
+              r->wide_vbv = wide_vbv;
             }
-            r.frame.i_type = force_idr ? X264_TYPE_IDR : X264_TYPE_AUTO;
-            r.frame.prop.mb_info = nullptr; r.frame.prop.mb_info_free = nullptr;
-            if (!refinement && !force_idr) r.frame.prop.mb_info = r.mb_info.data();
+            r->frame.i_type = force_idr ? X264_TYPE_IDR : X264_TYPE_AUTO;
+            r->frame.prop.mb_info = nullptr; r->frame.prop.mb_info_free = nullptr;
+            if (!refinement && !force_idr) r->frame.prop.mb_info = r->mb_info.data();
             x264_nal_t* nals = nullptr;
             int nal_count = 0;
             x264_picture_t picture;
-            const int size = x264_encoder_encode(r.codec, &nals, &nal_count, &r.frame, &picture);
+            const int size = x264_encoder_encode(r->codec, &nals, &nal_count, &r->frame, &picture);
             require(size > 0 && nal_count > 0 && nals && picture.i_pts == last_pts &&
                     static_cast<size_t>(size) <= FlowControl::max_bytes,
                     "invalid or delayed encoded access unit");
@@ -452,7 +473,7 @@ struct CaptureEncoder::Impl {
             if (++consecutive_failures >= 3) {
               throw std::runtime_error(std::string("capture failed three consecutive times: ") + error.what());
             }
-            r.openEncoder();
+            r->openEncoder();
             retry_after = Clock::now() + std::chrono::seconds(1);
           }
           continue;
@@ -489,8 +510,8 @@ struct CaptureEncoder::Impl {
   }
 };
 
-CaptureEncoder::CaptureEncoder(Publish publish, CaptureSettings settings, CaptureSourceFactory factory, PublishCursor cursor)
-    : impl_(std::make_unique<Impl>(std::move(publish), settings, std::move(factory), std::move(cursor))) {}
+CaptureEncoder::CaptureEncoder(Publish publish, CaptureSettings settings, CaptureSourceFactory factory, PublishCursor cursor, Resized resized)
+    : impl_(std::make_unique<Impl>(std::move(publish), settings, std::move(factory), std::move(cursor), std::move(resized))) {}
 CaptureEncoder::~CaptureEncoder() { stop(); }
 bool CaptureEncoder::start(std::string& error) {
   auto& i = *impl_;

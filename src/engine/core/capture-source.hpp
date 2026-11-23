@@ -44,6 +44,8 @@ class CaptureSource {
   virtual WaitHandle fd() const = 0;
   /** Pixel size of every full frame this source captures. */
   virtual std::pair<int, int> dimensions() const = 0;
+  /** True once the source can no longer deliver frames of dimensions(); the owner replaces it with a new one from the factory. */
+  virtual bool resized() const { return false; }
   virtual bool drainDamage() = 0;
   virtual PixelFormat pixelFormat() const = 0;
   virtual FrameView capture() = 0;

@@ -24,6 +24,7 @@ namespace {
 constexpr CGEventTapLocation eventTap = kCGHIDEventTap;
 /// Sign that turns a positive relay notch into a line step down or right; flip it if the VM scrolls backwards.
 constexpr int scrollSign = -1;
+constexpr std::chrono::milliseconds display_refresh{250};
 /// Points of cursor travel still counted as the same click position.
 constexpr double clickSlop = 5;
 /// Modifier flag a held key contributes to every posted event.
@@ -38,8 +39,9 @@ constexpr CGEventFlags modifierFlag(NativeKey key) {
 }
 /// Applies queued input as CGEvents on one thread that owns a private event source.
 class MacInput final : public InputBackend {
-  CGRect bounds{};
-  uint16_t width = 0, height = 0;
+  mutable std::mutex displayMutex;
+  mutable macos::Display display{};
+  mutable std::chrono::steady_clock::time_point displayChecked{};
   CGEventSourceRef source = nullptr;
   CGPoint position{}, clickPoint{};
   std::set<NativeKey> held;
@@ -56,11 +58,9 @@ class MacInput final : public InputBackend {
 
  public:
   MacInput() {
-    const auto display = macos::findDisplay();
-    bounds = display.bounds;
-    width = uint16_t(display.width);
-    height = uint16_t(display.height);
-    position = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
+    display = macos::findDisplay();
+    displayChecked = std::chrono::steady_clock::now();
+    position = CGPointMake(CGRectGetMidX(display.bounds), CGRectGetMidY(display.bounds));
     capsLock = (CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & kCGEventFlagMaskAlphaShift) != 0;
     clickInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>([NSEvent doubleClickInterval]));
@@ -71,7 +71,10 @@ class MacInput final : public InputBackend {
     wake.notify_all();
     if (worker.joinable()) worker.join();
   }
-  std::pair<uint16_t, uint16_t> dimensions() const override { return {width, height}; }
+  std::pair<uint16_t, uint16_t> dimensions() const override {
+    const auto current = currentDisplay();
+    return {uint16_t(current.width), uint16_t(current.height)};
+  }
   const char* name() const override { return "macos"; }
   std::optional<NativeKey> nativeKey(uint16_t usage) const override {
     const int key = macos::macKey(hidKeycode(usage));
@@ -258,9 +261,21 @@ class MacInput final : public InputBackend {
     }
     while (!heldButtons.empty()) applyButton(heldButtons.begin()->first, false, flags());
   }
+  /// The selected display, looked up again at most every display_refresh so a size or position change reaches pointer mapping.
+  macos::Display currentDisplay() const {
+    std::lock_guard<std::mutex> lock(displayMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - displayChecked >= display_refresh) {
+      displayChecked = now;
+      try { display = macos::findDisplay(); }
+      catch (const std::exception&) {}
+    }
+    return display;
+  }
   CGPoint globalPoint(int x, int y) const {
-    return CGPointMake(bounds.origin.x + (x + 0.5) * bounds.size.width / std::max(1, int(width)),
-                       bounds.origin.y + (y + 0.5) * bounds.size.height / std::max(1, int(height)));
+    const auto current = currentDisplay();
+    return CGPointMake(current.bounds.origin.x + (x + 0.5) * current.bounds.size.width / std::max(1, current.width),
+                       current.bounds.origin.y + (y + 0.5) * current.bounds.size.height / std::max(1, current.height));
   }
   CGEventType motionType() const {
     if (heldButtons.count(1)) return kCGEventLeftMouseDragged;
