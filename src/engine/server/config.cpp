@@ -184,15 +184,33 @@ uint64_t Grants::issue(std::string token, GrantScope scope, Clock::time_point no
 const Grants::Grant* Grants::find(const std::string& token, Clock::time_point now) const {
   if (token.empty()) return nullptr;
   for (const auto& grant : grants) {
-    if (now < grant.expires && secretEqual(token, grant.token)) return grant.single && grant.claimed ? nullptr : &grant;
+    if (now < grant.expires && secretEqual(token, grant.token)) return &grant;
   }
   return nullptr;
 }
+const Grants::Grant* Grants::available(const std::string& token, Clock::time_point now) const {
+  const auto* grant = find(token, now);
+  return grant && (!grant->single || grant->use == Use::unused) ? grant : nullptr;
+}
 bool Grants::claim(uint64_t id) {
   const auto entry = std::find_if(grants.begin(), grants.end(), [id](const auto& grant) { return grant.id == id; });
-  if (entry == grants.end() || (entry->single && entry->claimed)) return false;
-  entry->claimed = true;
+  if (entry == grants.end() || (entry->single && entry->use != Use::unused)) return false;
+  if (entry->single) entry->use = Use::used;
   return true;
+}
+bool Grants::reserve(uint64_t id) {
+  const auto entry = std::find_if(grants.begin(), grants.end(), [id](const auto& grant) { return grant.id == id; });
+  if (entry == grants.end() || (entry->single && entry->use != Use::unused)) return false;
+  if (entry->single) entry->use = Use::reserved;
+  return true;
+}
+void Grants::commit(uint64_t id) {
+  const auto entry = std::find_if(grants.begin(), grants.end(), [id](const auto& grant) { return grant.id == id; });
+  if (entry != grants.end() && entry->single && entry->use == Use::reserved) entry->use = Use::used;
+}
+void Grants::release(uint64_t id) {
+  const auto entry = std::find_if(grants.begin(), grants.end(), [id](const auto& grant) { return grant.id == id; });
+  if (entry != grants.end() && entry->single && entry->use == Use::reserved) entry->use = Use::unused;
 }
 bool Grants::active(uint64_t id, Clock::time_point now) const {
   return std::any_of(grants.begin(), grants.end(), [id, now](const auto& grant) { return id == grant.id && now < grant.expires; });

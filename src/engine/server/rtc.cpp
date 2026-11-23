@@ -10,6 +10,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -26,6 +27,41 @@ const char* rtcStateName(RtcState state) {
     case RtcState::closed: return "closed";
   }
   return "unknown";
+}
+
+bool RtcAnswerGate::begin() {
+  if (state_ != RtcAnswerState::idle) return false;
+  state_ = RtcAnswerState::pending;
+  answer_sdp_.clear();
+  error_.clear();
+  return true;
+}
+
+void RtcAnswerGate::resolve(std::string sdp) {
+  if (state_ != RtcAnswerState::pending) return;
+  answer_sdp_ = std::move(sdp);
+  error_.clear();
+  state_ = RtcAnswerState::answered;
+}
+
+void RtcAnswerGate::reject(std::string reason) {
+  if (state_ != RtcAnswerState::pending) return;
+  error_ = reason.empty() ? std::string("rtc_failed") : std::move(reason);
+  answer_sdp_.clear();
+  state_ = RtcAnswerState::failed;
+}
+
+RtcAnswerState RtcAnswerGate::state() const { return state_; }
+
+bool RtcAnswerGate::settled() const {
+  return state_ == RtcAnswerState::answered || state_ == RtcAnswerState::failed;
+}
+
+bool RtcAnswerGate::take(std::string& answer_sdp, std::string& error) const {
+  if (!settled()) return false;
+  answer_sdp = answer_sdp_;
+  error = error_;
+  return true;
 }
 
 namespace {
@@ -150,13 +186,12 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
   std::thread gather_thread;
   std::thread send_thread;
   RtcState state = RtcState::idle;
-  bool answer_ready = false;
+  RtcAnswerGate answer;
+  bool ever_connected = false;
   bool awaiting_keyframe = true;
   bool gathering_complete = false;
   std::optional<Clock::time_point> disconnected_at;
   Clock::time_point last_overrun_idr{};
-  std::string answer_sdp;
-  std::string error;
   std::deque<std::array<uint8_t, 16>> input;
   std::deque<RtcAck> ack_queue;
   struct PendingFrame {
@@ -193,18 +228,32 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
   }
 
   void fail(const std::string& reason) {
+#ifdef RELAY_RTC
+    std::shared_ptr<rtc::DataChannel> dc, events;
+    std::shared_ptr<rtc::Track> tr;
+    std::shared_ptr<rtc::PeerConnection> peer;
+#endif
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (!answer_ready) {
-        error = reason;
-        answer_sdp.clear();
-        answer_ready = true;
-      }
+      answer.reject(reason);
       state = RtcState::closed;
+      disconnected_at.reset();
       pending_frames.clear();
+#ifdef RELAY_RTC
+      dc = std::move(channel);
+      events = std::move(events_channel);
+      tr = std::move(track);
+      peer = std::move(pc);
+#endif
       cv.notify_all();
       send_cv.notify_all();
     }
+#ifdef RELAY_RTC
+    if (dc) dc->close();
+    if (events) events->close();
+    if (tr) tr->close();
+    if (peer) peer->close();
+#endif
     wake();
   }
 
@@ -216,24 +265,21 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
 #endif
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (state == RtcState::closed) return;
-      state = RtcState::closing;
-      if (!answer_ready) {
-        error = "rtc_closed";
-        answer_sdp.clear();
-        answer_ready = true;
-      }
-      state = RtcState::closed;
-      disconnected_at.reset();
-      pending_frames.clear();
-      cv.notify_all();
-      send_cv.notify_all();
+      answer.reject("rtc_closed");
 #ifdef RELAY_RTC
       dc = std::move(channel);
       events = std::move(events_channel);
       tr = std::move(track);
       peer = std::move(pc);
 #endif
+      if (state != RtcState::closed) {
+        state = RtcState::closing;
+        state = RtcState::closed;
+        disconnected_at.reset();
+        pending_frames.clear();
+        cv.notify_all();
+        send_cv.notify_all();
+      }
     }
 #ifdef RELAY_RTC
     if (dc) dc->close();
@@ -248,13 +294,13 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (state != RtcState::idle) return;
+      answer = RtcAnswerGate{};
+      answer.begin();
+      ever_connected = false;
       state = RtcState::gathering;
-      answer_ready = false;
       awaiting_keyframe = true;
       gathering_complete = false;
       disconnected_at.reset();
-      answer_sdp.clear();
-      error.clear();
       pending_frames.clear();
     }
     auto self = shared_from_this();
@@ -472,12 +518,14 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
           if (self->state == RtcState::closed || self->state == RtcState::closing) return;
           if (s == rtc::PeerConnection::State::Connected) {
             self->state = RtcState::connected;
+            self->ever_connected = true;
             self->disconnected_at.reset();
             should_wake = true;
           } else if (s == rtc::PeerConnection::State::Disconnected) {
             if (!self->disconnected_at) self->disconnected_at = Clock::now();
             should_wake = true;
           } else if (s == rtc::PeerConnection::State::Failed || s == rtc::PeerConnection::State::Closed) {
+            self->answer.reject("rtc_failed");
             self->state = RtcState::closed;
             self->disconnected_at.reset();
             self->pending_frames.clear();
@@ -498,11 +546,20 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
         }
       });
 
+      const auto abandon = [this, &peer] {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          answer.reject("rtc_failed");
+        }
+        peer->close();
+        wake();
+      };
+
       {
         std::unique_lock<std::mutex> lock(mutex);
         if (state == RtcState::closed || state == RtcState::closing) {
           lock.unlock();
-          peer->close();
+          abandon();
           return;
         }
         pc = peer;
@@ -515,24 +572,32 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
         cv.wait_for(lock, std::chrono::seconds(2), [this] {
           return gathering_complete || state == RtcState::closed || state == RtcState::closing;
         });
-        if (state == RtcState::closed || state == RtcState::closing) return;
+        if (state == RtcState::closed || state == RtcState::closing) {
+          lock.unlock();
+          abandon();
+          return;
+        }
       }
 
       const auto local = peer->localDescription();
       if (!local) {
-        peer->close();
         fail("no_answer");
         return;
       }
       {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (state == RtcState::closed || state == RtcState::closing) return;
-        answer_sdp = std::string(*local);
-        error.clear();
-        answer_ready = true;
+        std::unique_lock<std::mutex> lock(mutex);
+        if (state == RtcState::closed || state == RtcState::closing) {
+          lock.unlock();
+          abandon();
+          return;
+        }
+        answer.resolve(std::string(*local));
         if (state == RtcState::gathering) state = RtcState::connecting;
       }
       wake();
+    } catch (const std::invalid_argument& ex) {
+      std::cerr << "RTC offer rejected: " << ex.what() << '\n';
+      fail("invalid_offer");
     } catch (const std::exception& ex) {
       std::cerr << "RTC offer failed: " << ex.what() << '\n';
       fail("rtc_failed");
@@ -606,10 +671,12 @@ struct RtcSession::Impl : public std::enable_shared_from_this<Impl> {
 
   bool takeAnswer(std::string& out_answer, std::string& out_error) {
     std::lock_guard<std::mutex> lock(mutex);
-    if (!answer_ready) return false;
-    out_answer = answer_sdp;
-    out_error = error;
-    return true;
+    return answer.take(out_answer, out_error);
+  }
+
+  bool everConnected() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return ever_connected;
   }
 
   std::deque<std::array<uint8_t, 16>> takeInput() {
@@ -653,5 +720,6 @@ RtcState RtcSession::state() const { std::lock_guard<std::mutex> lock(impl_->mut
 bool RtcSession::canSendInput() const { return impl_->can_send_input && !impl_->isClosed(); }
 bool RtcSession::canReceiveClipboard() const { return impl_->can_receive_clipboard && !impl_->isClosed(); }
 bool RtcSession::closed() const { return impl_->isClosed(); }
+bool RtcSession::everConnected() const { return impl_->everConnected(); }
 
 }  // namespace relay

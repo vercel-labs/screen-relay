@@ -30,7 +30,7 @@ const transportMode: TransportMode = parseTransport(transportParam);
 /** True when the link is allowed WebRTC and a WebSocket fallback behind it. */
 const rtcFallback = transportMode === 'rtc';
 let transport: TransportState = { state: 'ws-connecting' };
-/** The credential the link carries: the session token, or a watch or control grant that only opens WebSockets. */
+/** The credential the link carries: the session token, or a watch or control grant that opens a view-only stream. */
 type Access = 'owner' | 'watch' | 'control';
 let accessToken = '', access: Access = 'owner';
 const trustedPage = location.protocol === 'https:' || isLoopback(location.hostname);
@@ -440,6 +440,8 @@ const RTC_STAT_FIELDS = ['framesDecoded', 'framesDropped', 'framesReceived', 'pa
 const RTC_GRACE_MS = 4000;
 let pc: RTCPeerConnection | undefined, channel: RTCDataChannel | undefined, eventsChannel: RTCDataChannel | undefined,
   rtcSession: string | undefined, rtcGraceTimer: any;
+/** Inbound bytes and decoded frames at the last HUD sample, and the peer connection a sample is in flight for. */
+let rtcReceived: number | undefined, rtcDecoded: number | undefined, rtcSamplingPeer: RTCPeerConnection | undefined, videoFrameHandle = 0, rtcWidth = 0, rtcHeight = 0;
 /** What the engine reports about WebRTC: whether it is available, and the STUN and TURN servers it wants used. */
 type RtcConfig = { enabled: boolean; iceServers?: RTCIceServer[] };
 /** How long the background WebRTC upgrade may take before the viewer keeps the WebSocket stream, in ms. */
@@ -598,12 +600,59 @@ function videoRect(): [{ left: number; top: number; width: number; height: numbe
   const scale = w && h ? Math.min(box.width / w, box.height / h) : 0;
   return [{ left: box.left + (box.width - w * scale) / 2, top: box.top + (box.height - h * scale) / 2, width: w * scale, height: h * scale }, w, h];
 }
-/** Ends the session on the engine so it stops encoding for a peer connection the viewer has dropped. */
-function deleteRtc(session: string) {
-  fetch(session, { method: 'DELETE', cache: 'no-store', redirect: 'error', keepalive: true, headers: authHeaders() }).catch(() => {});
+/** True when the browser reports presented video frames, which is the drawn FPS the HUD shows over WebRTC. */
+function presentsFrames(): boolean {
+  return typeof (video as any).requestVideoFrameCallback === 'function';
 }
-/** Closes the peer connection, detaches the video element, and ends the session on the engine. */
-function endRtc() {
+/** Counts one presented video frame per composite and re-arms until WebRTC stops carrying the stream. */
+function countPresentedFrames() {
+  if (videoFrameHandle || video.hidden || !isRtcActive() || !presentsFrames()) return;
+  videoFrameHandle = (video as any).requestVideoFrameCallback(() => {
+    videoFrameHandle = 0;
+    if (video.hidden || !isRtcActive()) return;
+    stats.drawn++;
+    countPresentedFrames();
+  });
+}
+/** Cancels the presented-frame counter when the peer connection goes away. */
+function stopPresentedFrames() {
+  if (videoFrameHandle) (video as any).cancelVideoFrameCallback?.(videoFrameHandle);
+  videoFrameHandle = 0;
+}
+/** Adds the bytes and frames the peer connection received since the last sample to the HUD counters. */
+async function sampleRtc() {
+  const peer = pc;
+  if (!peer || rtcSamplingPeer === peer) return;
+  rtcSamplingPeer = peer;
+  try {
+    const reports = await peer.getStats();
+    if (pc !== peer) return;
+    let received: number | undefined, decoded: number | undefined;
+    reports.forEach((report: any) => {
+      if (report.type !== 'inbound-rtp' || (report.kind ?? report.mediaType) !== 'video' || report.isRemote) return;
+      if (Number.isFinite(report.bytesReceived)) received = report.bytesReceived;
+      if (Number.isFinite(report.framesDecoded)) decoded = report.framesDecoded;
+      if (report.frameWidth > 0 && report.frameHeight > 0) { rtcWidth = report.frameWidth; rtcHeight = report.frameHeight; }
+    });
+    if (received !== undefined) {
+      if (rtcReceived !== undefined && received >= rtcReceived) stats.bytes += received - rtcReceived;
+      rtcReceived = received;
+    }
+    if (!presentsFrames() && !video.paused && decoded !== undefined) {
+      if (rtcDecoded !== undefined && decoded >= rtcDecoded) stats.drawn += decoded - rtcDecoded;
+      rtcDecoded = decoded;
+    }
+  } catch (error) {
+  } finally {
+    if (rtcSamplingPeer === peer) rtcSamplingPeer = undefined;
+  }
+}
+/** Ends the session on the engine so it stops encoding for a peer connection the viewer has dropped. */
+function deleteRtc(session: string): Promise<void> {
+  return fetch(session, { method: 'DELETE', cache: 'no-store', redirect: 'error', keepalive: true, headers: authHeaders() }).then(() => {}, () => {});
+}
+/** Closes the peer connection, detaches the video element, and resolves once the engine ends the session. */
+function endRtc(): Promise<void> | undefined {
   clearTimeout(rtcGraceTimer);
   const peer = pc;
   pc = undefined;
@@ -611,19 +660,38 @@ function endRtc() {
   eventsChannel = undefined;
   liveEvents = undefined;
   peer?.close();
-  if (rtcSession) deleteRtc(rtcSession);
+  stopPresentedFrames();
+  rtcReceived = rtcDecoded = undefined;
+  rtcSamplingPeer = undefined;
+  rtcWidth = rtcHeight = 0;
+  const session = rtcSession;
   rtcSession = undefined;
   video.srcObject = null;
+  return session ? deleteRtc(session) : undefined;
 }
-/** Continues the stream over WebSocket after WebRTC failed, recording the reason in the transport state. */
+/** Continues the stream over WebSocket after WebRTC failed, once the engine has ended the old session. */
 function fallbackToWs(reason: string) {
   if (fellBackToWs) return;
   fellBackToWs = true;
   fellBackToReason = reason;
-  epoch++;
+  const owner = ++epoch;
   transport = { state: 'rtc-fallback-ws', reason };
-  reset();
-  connectWs();
+  const pendingDelete = endRtc();
+  if (!pendingDelete) {
+    reset();
+    connectWs();
+    return;
+  }
+  let done = false;
+  const finish = () => {
+    if (done || owner !== epoch) return;
+    done = true;
+    clearTimeout(guard);
+    reset();
+    connectWs();
+  };
+  const guard = setTimeout(finish, 1000);
+  pendingDelete.then(finish);
 }
 /** Reports a WebRTC failure: hands over to WebSocket when the session allows it, otherwise shows the reason. */
 function failRtc(reason: string, fallback = rtcFallback) {
@@ -722,6 +790,8 @@ function tryCutOver(attempt: RtcProbeSession) {
   video.hidden = false;
   canvas.hidden = true;
   transport = { state: 'rtc-live', fallback: true };
+  countPresentedFrames();
+  void sampleRtc();
   bindRtcSession(attempt.pc, true, epoch);
   setStatus(`${viewOnly ? 'Live · view only' : 'Live · you have control'} · WebRTC`);
   if (events.cursor) {
@@ -779,6 +849,8 @@ video.addEventListener('playing', () => {
   if (!isRtcActive()) return;
   ready = true;
   transport = { state: 'rtc-live', fallback: rtcFallback };
+  countPresentedFrames();
+  void sampleRtc();
   setStatus(`${viewOnly ? 'Live · view only' : 'Live · you have control'} · WebRTC`);
 });
 window.addEventListener('pagehide', () => {
@@ -1073,15 +1145,15 @@ new ResizeObserver(renderCursor).observe(canvas);
 window.addEventListener('scroll', renderCursor, { passive: true });
 window.addEventListener('blur', () => { release(); pointerPosition = null; renderCursor(); });
 const METRICS_UNAVAILABLE = 'Cgroup CPU (one core): unavailable · Cgroup RAM: unavailable';
-let hudTimer: any, metricsRequest: AbortController | null, configuredFps = 0, activeEncoder = '', activeTransferTier: string | number | null = null;
+let hudTimer: any, hudGeneration = 0, metricsRequest: AbortController | null, configuredFps = 0, activeEncoder = '', activeTransferTier: string | number | null = null;
 /** Names the transport carrying the stream, so the HUD shows when the background upgrade took over. */
 function transportLabel(): string {
   return isRtcActive() ? 'WebRTC' : 'WS';
 }
 function hudText(fps: number, mbps: number, metrics: string) {
   const live = isRtcActive();
-  const width = live && video.videoWidth ? video.videoWidth : canvas.width;
-  const height = live && video.videoHeight ? video.videoHeight : canvas.height;
+  const width = live ? video.videoWidth || rtcWidth || canvas.width : canvas.width;
+  const height = live ? video.videoHeight || rtcHeight || canvas.height : canvas.height;
   const encoder = [activeEncoder, activeTransferTier === null ? '' : `tier ${activeTransferTier}`].filter(Boolean).join(' · ');
   const stream = `Stream ${width}x${height}${configuredFps ? ` @ ${configuredFps} fps` : ''}${encoder ? ` · ${encoder}` : ''} · ${transportLabel()}`;
   return `${stream} · Drawn FPS: ${fps.toFixed(1)} · Stream Mbps: ${mbps.toFixed(2)} · ${metrics}`;
@@ -1102,14 +1174,20 @@ function loadCapabilities() {
     .catch(() => {});
 }
 function startHud() {
+  clearInterval(hudTimer);
+  const gen = ++hudGeneration;
   let previousTime = performance.now(),
     previousDrawn = stats.drawn,
     previousBytes = stats.bytes,
     previousCpu: number | undefined,
     previousCpuTime = 0,
     metrics = METRICS_UNAVAILABLE;
-  hudTimer = setInterval(() => {
-    const now = performance.now(), seconds = (now - previousTime) / 1000;
+  hudTimer = setInterval(async () => {
+    if (isRtcActive()) {
+      await sampleRtc();
+      if (gen !== hudGeneration || document.hidden) return;
+    }
+    const now = performance.now(), seconds = Math.max((now - previousTime) / 1000, 0.001);
     const fps = (stats.drawn - previousDrawn) / seconds;
     const mbps = (stats.bytes - previousBytes) * 8 / seconds / 1_000_000;
     document.querySelector('#hud')!.textContent = hudText(fps, mbps, metrics);
@@ -1150,6 +1228,7 @@ function startHud() {
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    hudGeneration++;
     clearInterval(hudTimer);
     metricsRequest?.abort();
     metricsRequest = null;

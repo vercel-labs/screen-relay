@@ -36,21 +36,29 @@ class Grants {
   using Clock = std::chrono::steady_clock;
   static constexpr size_t capacity = 32;
   static constexpr uint64_t max_ttl = 3600;
+  enum class Use : uint8_t { unused, reserved, used };
   struct Grant {
     uint64_t id;
     std::string token;
     GrantScope scope;
     Clock::time_point expires;
-    /** Opens one WebSocket only; `claimed` once it has. */
     bool single = false;
-    bool claimed = false;
+    Use use = Use::unused;
   };
   uint64_t issue(std::string token, GrantScope scope, Clock::time_point now, uint64_t ttl, bool single = false);
-  /** The live grant for a token, leaving out a single-connection grant that already opened its connection. */
+  /** The live grant for a token, regardless of its single-connection state. */
   const Grant* find(const std::string& token, Clock::time_point now) const;
+  /** The live grant for a token when a single-connection grant may still open a connection. */
+  const Grant* available(const std::string& token, Clock::time_point now) const;
   bool active(uint64_t id, Clock::time_point now) const;
-  /** Records that a grant opened a connection; false when a single-connection grant already did. */
+  /** Claims a single-connection grant for a WebSocket that is opening now; false when it is reserved or used. */
   bool claim(uint64_t id);
+  /** Reserves a single-connection grant for a negotiating RTC session; false when it is reserved or used. */
+  bool reserve(uint64_t id);
+  /** Marks a reserved single-connection grant as used once its RTC session connects. */
+  void commit(uint64_t id);
+  /** Frees a reserved single-connection grant that never connected; a used grant stays used. */
+  void release(uint64_t id);
   bool revoke(uint64_t id);
  private:
   std::vector<Grant> grants;

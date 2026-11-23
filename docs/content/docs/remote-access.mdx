@@ -36,7 +36,7 @@ The session stays on loopback, so the tunnel reaches it without a public URL. Li
    `--public` takes a bare HTTPS origin, sets the accepted public host, and creates a token. It does not change the listen address. Use the configured HTTPS URL for remote access. The built-in viewer still works on the same loopback address, including through an SSH tunnel. See [Browser origins](#browser-origins) for embedded viewers.
 
 2. Configure the proxy to:
-   - forward every path with no prefix, including `/viewer.js`, `/stream`, and `/control` ([endpoints](/docs/protocol#endpoints))
+   - forward every path with no prefix, including `/viewer.js`, `/stream`, `/control`, and the `/rtc` endpoints ([endpoints](/docs/protocol#endpoints))
    - forward WebSocket upgrades over HTTP/1.1
    - pass `Host`, `Origin`, and `Authorization` through unchanged, and keep the WebSocket subprotocol header
    - keep `Authorization` and the subprotocol header out of its logs, because the token travels in both
@@ -68,7 +68,7 @@ A browser sends an `Origin` header on WebSocket connections and on cross-origin 
 | Started with `--public` | The `--public` origin, each origin in `--allow-origin`, and a loopback page whose origin uses the same `HOST:PORT` it connects to, such as `http://127.0.0.1:8080`. |
 | Started without `--public` | Loopback origins (`http` or `https`, `localhost` or `127.0.0.1`, any port), and each origin in `--allow-origin`. |
 
-A request from any other origin gets 403 `forbidden`, and a WebSocket fails its handshake. The CLI, the Node SDK, and other clients that send no `Origin` header are not affected. A WebSocket that uses a [grant](#grants) skips this check, so a viewer embedded on an opaque or changing origin, such as in an MCP App host, can connect with a grant.
+A request from any other origin gets 403 `forbidden`, and a WebSocket fails its handshake. The CLI, the Node SDK, and other clients that send no `Origin` header are not affected. A WebSocket that uses a [grant](#grants) skips this check, so a viewer embedded on an opaque or changing origin, such as in an MCP App host, can connect with a grant. An HTTP request that uses a grant does not skip the check.
 
 To let a page on another origin connect, such as an app that embeds the viewer, list its origin when you start the session:
 
@@ -92,7 +92,7 @@ screen-relay up -d --public https://desktop.example.com --allow-origin http://lo
 
 A page on an allowed origin can open the WebSocket stream. The engine checks the `Origin` header during the WebSocket handshake, and browsers do not apply CORS to WebSocket connections, so the stream works from another origin once you allow it.
 
-Browser HTTP requests do follow CORS. The engine sends no `Access-Control-Allow-Origin` header, so a page on another origin cannot read `/capabilities`, `/metrics`, `/screenshot.png`, or the clipboard endpoint, even when `--allow-origin` lists it. Serve the viewer from the relay origin when it needs those endpoints. An embedded viewer that only uses the WebSocket works from an allowed origin.
+Browser HTTP requests do follow CORS. The engine sends no `Access-Control-Allow-Origin` header, so a page on another origin cannot read `/capabilities`, `/metrics`, `/screenshot.png`, `/rtc/config`, or the clipboard endpoint, and cannot send `POST /rtc`, even when `--allow-origin` lists it. Serve the viewer from the relay origin when it needs those endpoints. An embedded viewer that only uses the WebSocket works from an allowed origin.
 
 ### Update an app that connects from another origin
 
@@ -123,10 +123,10 @@ A grant gives someone part of a session for a limited time without giving them t
 
 | Scope | What the holder can do |
 | --- | --- |
-| `watch` | Watch the desktop. |
-| `control` | Watch the desktop and send input, in the viewer or over `/control`. |
+| `watch` | Watch the desktop over a WebSocket or a WebRTC session. |
+| `control` | Watch the desktop and send input, in the viewer, over `/control`, or over a WebRTC session. |
 
-Neither scope can read or set the clipboard, take a screenshot over HTTP, send `POST /input`, or create and revoke grants.
+Neither scope can read or set the clipboard, take a screenshot over HTTP, send `POST /input`, or create and revoke grants. A grant can call `GET /rtc/config`, `POST /rtc`, and `DELETE /rtc/session` or `DELETE /rtc/sessions/ID` for the session it created. No other HTTP endpoint accepts a grant. A WebRTC session opened with a grant receives no clipboard notices.
 
 1. Create the grant from a machine that has the token. This example creates a watch grant that lasts 10 minutes. Without `ttl`, a grant lasts 3600 seconds, which is also the maximum.
 
@@ -157,11 +157,11 @@ Neither scope can read or set the clipboard, take a screenshot over HTTP, send `
    curl -s -X DELETE -H "Authorization: Bearer $(cat ./token)" "https://desktop.example.com/grants/ID"
    ```
 
-Add `connections=1` to create a grant that opens only one WebSocket, such as `?ttl=120&connections=1`. Its connection stays open, and once the grant has been used, a copied link fails to connect: the engine refuses its WebSocket handshake.
+Add `connections=1` to create a grant that opens only one connection, either a WebSocket or a WebRTC session, such as `?ttl=120&connections=1`. The connection stays open, and while a WebRTC session connects or stays open, the grant can still end that session. If the session ends before it connects, the grant is released, so the viewer can fall back to a WebSocket. Once a connection opens, a copied link can no longer connect: the engine refuses the WebSocket handshake, and `/rtc/config` or `POST /rtc` returns `401`.
 
 When a grant is revoked or expires, the engine closes the connections opened with it and refuses new ones. Other viewers and clients stay connected. Grants are kept in memory, so `screen-relay down` ends them all.
 
-A custom client sends the grant's `token` the same way as the session token. The [protocol](https://github.com/vercel-labs/screen-relay/blob/main/PROTOCOL.md#grants) lists the WebSocket URLs each scope opens.
+A custom client sends the grant's `token` as `bearer.TOKEN` on a WebSocket and as `Authorization: Bearer TOKEN` on a WebRTC HTTP request. The [protocol](https://github.com/vercel-labs/screen-relay/blob/main/PROTOCOL.md#grants) lists the WebSocket and WebRTC access each scope has.
 
 ## Control a session from your laptop
 

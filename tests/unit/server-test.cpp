@@ -187,17 +187,52 @@ int main() {
     assert(grants.find("0", start + std::chrono::seconds(2)));
   }
   {
-    // A single-connection grant opens one connection, which stays active; a
-    // plain grant can open any number.
     Grants grants;
     const auto start = Grants::Clock::now();
     const auto once = grants.issue("once", GrantScope::control, start, 60, true);
-    const auto many = grants.issue("many", GrantScope::control, start, 60);
-    assert(grants.find("once", start) && grants.claim(once));
-    assert(!grants.find("once", start) && !grants.claim(once));
+    assert(grants.find("once", start) && grants.available("once", start));
+    assert(grants.reserve(once));
+    assert(grants.find("once", start) && !grants.available("once", start));
+    assert(!grants.reserve(once) && !grants.claim(once));
+    grants.release(once);
+    assert(grants.find("once", start) && grants.available("once", start));
+    assert(grants.claim(once));
+    assert(grants.find("once", start) && !grants.available("once", start));
+    assert(!grants.claim(once) && !grants.reserve(once));
     assert(grants.active(once, start));
-    assert(grants.claim(many) && grants.claim(many) && grants.find("many", start));
-    assert(grants.revoke(once) && !grants.active(once, start) && !grants.claim(once));
+    assert(grants.revoke(once) && !grants.active(once, start) && !grants.claim(once) && !grants.find("once", start));
+  }
+  {
+    Grants grants;
+    const auto start = Grants::Clock::now();
+    const auto once = grants.issue("once", GrantScope::control, start, 60, true);
+    assert(grants.reserve(once));
+    grants.commit(once);
+    assert(grants.find("once", start)->use == Grants::Use::used);
+    assert(grants.find("once", start) && !grants.available("once", start));
+    grants.release(once);
+    assert(grants.find("once", start) && !grants.available("once", start));
+    assert(!grants.claim(once) && !grants.reserve(once));
+    assert(grants.revoke(once) && !grants.active(once, start) && !grants.find("once", start));
+  }
+  {
+    Grants grants;
+    const auto start = Grants::Clock::now();
+    const auto many = grants.issue("many", GrantScope::control, start, 60);
+    assert(grants.available("many", start));
+    assert(grants.reserve(many) && grants.available("many", start));
+    grants.commit(many);
+    assert(grants.available("many", start));
+    grants.release(many);
+    assert(grants.available("many", start));
+    assert(grants.claim(many) && grants.claim(many) && grants.find("many", start) && grants.available("many", start));
+  }
+  {
+    Grants grants;
+    const auto start = Grants::Clock::now();
+    const auto once = grants.issue("once", GrantScope::control, start, 60, true);
+    assert(grants.claim(once));
+    assert(!grants.issue("once", GrantScope::control, start, 60, true));
   }
   {
     unsigned char first[300] = {}, second[300] = {};
@@ -421,6 +456,49 @@ int main() {
     assert(!rtcAdmission(3, 1, 2, 1, 0, false).allowed);
     assert(!connectionPlan(Socket::take, 1, true, false, 0, true, false).open);
 
+  }
+  {
+    RtcAnswerGate gate;
+    std::string answer, error;
+    assert(!gate.settled() && !gate.take(answer, error));
+  }
+  {
+    RtcAnswerGate gate;
+    assert(gate.begin() && gate.state() == RtcAnswerState::pending && !gate.begin());
+  }
+  {
+    RtcAnswerGate gate;
+    std::string answer, error;
+    assert(gate.begin());
+    gate.reject("rtc_failed");
+    gate.resolve("sdp");
+    assert(gate.state() == RtcAnswerState::failed && gate.take(answer, error) && error == "rtc_failed" && answer.empty());
+  }
+  {
+    RtcAnswerGate gate;
+    std::string answer, error;
+    assert(gate.begin());
+    gate.resolve("v=0");
+    gate.reject("rtc_closed");
+    assert(gate.state() == RtcAnswerState::answered && gate.take(answer, error) && answer == "v=0" && error.empty());
+  }
+  {
+    RtcAnswerGate gate;
+    std::string answer, error;
+    assert(gate.begin());
+    gate.reject("");
+    assert(gate.state() == RtcAnswerState::failed && gate.take(answer, error) && error == "rtc_failed" && answer.empty());
+  }
+  {
+    assert(classifyRtcOffer(false, false, false) == RtcOfferOutcome::waiting);
+    assert(classifyRtcOffer(true, true, false) == RtcOfferOutcome::answered);
+    assert(classifyRtcOffer(true, false, false) == RtcOfferOutcome::failed);
+    assert(classifyRtcOffer(false, false, true) == RtcOfferOutcome::failed);
+    assert(rtcOfferErrorStatus("no_h264") == HTTP_STATUS_BAD_REQUEST);
+    assert(rtcOfferErrorStatus("invalid_offer") == HTTP_STATUS_BAD_REQUEST);
+    assert(rtcOfferErrorStatus("rtc_failed") == HTTP_STATUS_SERVICE_UNAVAILABLE);
+    assert(rtcOfferErrorStatus("no_answer") == HTTP_STATUS_SERVICE_UNAVAILABLE);
+    assert(rtcOfferErrorStatus("rtc_timeout") == HTTP_STATUS_SERVICE_UNAVAILABLE);
   }
 #ifndef RELAY_RTC
   {

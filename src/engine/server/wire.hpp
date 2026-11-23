@@ -51,6 +51,11 @@ struct RtcAdmission {
 /** Checks total and delegated viewer limits and whether an owner must replace a viewer. */
 RtcAdmission rtcAdmission(size_t wsViewerCount, size_t wsGrantViewerCount,
                           size_t rtcViewerCount, size_t rtcGrantViewerCount, uint64_t callerGrantId, bool hasReplaceableGrantRtc);
+enum class RtcOfferOutcome : uint8_t { waiting, answered, failed };
+/** Classifies a pending RTC offer from its answer gate and terminal closed state. */
+RtcOfferOutcome classifyRtcOffer(bool settled, bool hasAnswer, bool sessionClosed);
+/** Maps a settled RTC offer error code to the HTTP status code returned to the client. */
+unsigned rtcOfferErrorStatus(const std::string& error);
 /**
  * The builders below fill out with pre zero bytes of caller padding followed by one NSL1 message.
  * frameMessage and cursorMessage return false when the payload must not be sent.

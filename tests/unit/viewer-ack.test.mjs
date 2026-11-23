@@ -4,9 +4,9 @@ import { test } from 'node:test';
 import { createContext, runInContext } from 'node:vm';
 
 function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = false, fetch = async () => ({ ok: false, status: 401 }), navigator, hash = '', rtc } = {}) {
-  const listeners = {}, windowListeners = {}, elements = {}, sockets = [], trace = [], animationFrames = new Map(), timers = [];
+  const listeners = {}, windowListeners = {}, elements = {}, sockets = [], trace = [], animationFrames = new Map(), timers = [], intervals = new Map();
   const decodeQueue = [];
-  let now = 0, nextAnimationFrame = 1;
+  let now = 0, nextAnimationFrame = 1, nextInterval = 1;
   const element = () => {
     const children = {};
     return {
@@ -59,11 +59,13 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
     document, window: { devicePixelRatio, VideoDecoder: Decoder, EncodedVideoChunk: true, addEventListener: (name, callback) => { windowListeners[name] = callback; } },
     location: { protocol: 'http:', hostname: 'localhost', host: 'localhost', href: 'http://localhost/', hash, pathname: '/', search: '' },
     history: { replaceState() {} },
-    URL, URLSearchParams, AbortSignal, WebSocket: Socket, VideoDecoder: Decoder,
+    URL, URLSearchParams, AbortSignal, AbortController, WebSocket: Socket, VideoDecoder: Decoder,
     EncodedVideoChunk: class { constructor(options) { Object.assign(this, options); } },
     ImageData: class { constructor(pixels, width, height) { this.pixels = pixels; this.width = width; this.height = height; } },
     MutationObserver: class { observe() {} }, ResizeObserver: class { observe() {} },
-    performance: { now: () => now }, setInterval: () => 1, clearInterval() {},
+    performance: { now: () => now },
+    setInterval: (callback) => { const id = nextInterval++; intervals.set(id, callback); return id; },
+    clearInterval: (id) => { intervals.delete(id); },
     setTimeout: (callback) => timers.push(callback), clearTimeout() {}, navigator,
     requestAnimationFrame(callback) { const id = nextAnimationFrame++; animationFrames.set(id, callback); return id; },
     cancelAnimationFrame(id) { animationFrames.delete(id); },
@@ -93,7 +95,7 @@ function viewer({ devicePixelRatio = 1, storage, decode = true, deferDecode = fa
     entry[1](now);
   };
   const timersAfter = (mark) => { for (const callback of timers.splice(mark)) callback(); };
-  return { context, document, listeners, windowListeners, sockets, trace, frame, tick, refresh, timerCount: () => timers.length, timersAfter, runTimer: (index) => timers.splice(index, 1)[0](), setTime: (time) => { now = time; }, decodeAll: () => { while (decodeQueue.length) decodeQueue.shift()(); } };
+  return { context, document, listeners, windowListeners, sockets, trace, frame, tick, refresh, hudTick: async () => { for (const callback of [...intervals.values()]) await callback(); }, intervalCount: () => intervals.size, timerCount: () => timers.length, timersAfter, runTimer: (index) => timers.splice(index, 1)[0](), setTime: (time) => { now = time; }, decodeAll: () => { while (decodeQueue.length) decodeQueue.shift()(); } };
 }
 
 const traced = (app, type) => app.trace.filter((event) => event[0] === type).map((event) => event[1]);
@@ -1090,7 +1092,7 @@ function fakeRtc() {
     async setLocalDescription(description) { this.localDescription = description; }
     async setRemoteDescription(description) { this.remoteDescription = description; }
     addEventListener() {}
-    async getStats() { return new Map(); }
+    async getStats() { return this.statsSource ? this.statsSource() : new Map(); }
     close() { this.closed = true; }
     connect() { this.connectionState = 'connected'; this.onconnectionstatechange?.(); }
   }
@@ -1220,5 +1222,140 @@ test('the background probe keeps the WebSocket stream live and hands over only o
   assert.equal(ack.getUint32(8), 5);
   assert.equal(ack.getUint32(12), 2);
   assert.equal(ack.byteLength, 24);
+});
+
+const rtcReport = (bytes, frames, width = 1920, height = 1080) => new Map([
+  ['inbound-1', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, framesDecoded: frames, frameWidth: width, frameHeight: height }],
+]);
+
+async function rtcViewer() {
+  const rtc = fakeRtc();
+  const app = viewer({
+    hash: '#transport=rtc',
+    rtc,
+    fetch: async (path) => {
+      if (path === '/capabilities') return { ok: true, json: async () => ({ fps: 60, rtc: true, encoder: 'h264', transfer_tier: 2 }) };
+      if (path === '/rtc/config') return { ok: true, json: async () => ({ enabled: true }) };
+      if (path === '/rtc') return { ok: true, headers: { get: () => '/rtc/sessions/7' }, text: async () => 'answer-sdp' };
+      return { ok: false, status: 404 };
+    },
+  });
+  await settle();
+  await settle();
+  const peer = rtc.peers[0];
+  const video = app.document.querySelector('#video');
+  video.videoWidth = 1920;
+  video.videoHeight = 1080;
+  peer.connect();
+  return { rtc, app, peer, video, hud: () => app.document.querySelector('#hud').textContent };
+}
+
+test('the HUD reports drawn FPS and stream Mbps over WebRTC', async () => {
+  const { app, peer, video, hud } = await rtcViewer();
+  peer.statsSource = () => rtcReport(100_000_000, 60);
+  video.handlers.playing();
+  await settle();
+  assert.equal(app.context.window.nativeStats.bytes, 0);
+  assert.equal(app.context.window.nativeStats.drawn, 0);
+  peer.statsSource = () => rtcReport(102_000_000, 120);
+  app.setTime(1000);
+  await app.hudTick();
+  assert.match(hud(), /Stream 1920x1080 @ 60 fps · h264 · tier 2 · WebRTC/);
+  assert.match(hud(), /Drawn FPS: 60\.0/);
+  assert.match(hud(), /Stream Mbps: 16\.00/);
+  assert.equal(app.context.window.nativeStats.bytes, 2_000_000);
+  assert.equal(app.context.window.nativeStats.drawn, 60);
+});
+
+test('presented video frames drive the WebRTC FPS when requestVideoFrameCallback exists', async () => {
+  const { app, peer, video, hud } = await rtcViewer();
+  const callbacks = [];
+  video.requestVideoFrameCallback = (callback) => { callbacks.push(callback); return callbacks.length; };
+  video.cancelVideoFrameCallback = () => {};
+  peer.statsSource = () => rtcReport(1_000_000, 300);
+  video.handlers.playing();
+  await settle();
+  assert.equal(callbacks.length, 1);
+  app.setTime(1000);
+  const tick = app.hudTick();
+  callbacks.shift()();
+  callbacks.shift()();
+  callbacks.shift()();
+  await tick;
+  assert.equal(app.context.window.nativeStats.drawn, 3);
+  assert.match(hud(), /Drawn FPS: 3\.0/);
+});
+
+test('WebRTC stats samples never overlap and a counter reset does not report a rate', async () => {
+  const { app, peer, video, hud } = await rtcViewer();
+  const pending = [];
+  peer.statsSource = () => new Promise((resolve) => pending.push(resolve));
+  video.handlers.playing();
+  assert.equal(pending.length, 1);
+  app.setTime(1000);
+  const first = app.hudTick();
+  assert.equal(pending.length, 1);
+  pending[0](rtcReport(100_000_000, 60));
+  await settle();
+  await first;
+  assert.equal(app.context.window.nativeStats.bytes, 0);
+  peer.statsSource = () => new Promise((resolve) => pending.push(resolve));
+  app.setTime(2000);
+  const second = app.hudTick();
+  assert.equal(pending.length, 2);
+  pending[1](rtcReport(10, 61));
+  await second;
+  peer.statsSource = () => rtcReport(10, 61);
+  app.setTime(3000);
+  await app.hudTick();
+  assert.match(hud(), /Stream Mbps: 0\.00/);
+  assert.equal(app.context.window.nativeStats.bytes, 0);
+});
+
+test('falling back from WebRTC waits for the session delete before opening the WebSocket', async () => {
+  const rtc = fakeRtc();
+  const requests = [];
+  let settleDelete;
+  const app = viewer({
+    hash: '#transport=rtc',
+    rtc,
+    fetch: async (path, options = {}) => {
+      requests.push([path, options.method ?? 'GET']);
+      if (path === '/capabilities') return { ok: true, json: async () => ({ fps: 60, rtc: true }) };
+      if (path === '/rtc/config') return { ok: true, json: async () => ({ enabled: true }) };
+      if (path === '/rtc') return { ok: true, headers: { get: () => '/rtc/sessions/7' }, text: async () => 'answer-sdp' };
+      if (options.method === 'DELETE') return new Promise((resolve) => { settleDelete = () => resolve({ ok: true }); });
+      return { ok: false, status: 404 };
+    },
+  });
+  await settle();
+  await settle();
+  const peer = rtc.peers[0], video = app.document.querySelector('#video');
+  video.videoWidth = 1280;
+  video.videoHeight = 720;
+  peer.statsSource = () => rtcReport(2_000_000, 0, 1280, 720);
+  peer.connect();
+  video.handlers.playing();
+  await settle();
+  peer.connectionState = 'failed';
+  peer.onconnectionstatechange();
+  assert.equal(app.sockets.length, 0);
+  const deletes = requests.filter(([, method]) => method === 'DELETE');
+  assert.equal(deletes.length, 1);
+  assert.match(deletes[0][0], /\/rtc\/sessions\/7$/);
+  assert.equal(typeof settleDelete, 'function');
+  settleDelete();
+  await settle();
+  await settle();
+  assert.equal(app.sockets.length, 1);
+  app.sockets[0].onopen();
+  app.setTime(1000);
+  await app.hudTick();
+  app.frame(1, 1280, 720, 100_000);
+  app.setTime(2000);
+  await app.hudTick();
+  assert.match(app.document.querySelector('#hud').textContent, /· WS ·/);
+  assert.match(app.document.querySelector('#hud').textContent, /Drawn FPS: 1\.0/);
+  assert.match(app.document.querySelector('#hud').textContent, /Stream Mbps: 0\.80/);
 });
 

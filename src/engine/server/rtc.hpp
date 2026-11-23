@@ -18,6 +18,31 @@ enum class RtcState : uint8_t { idle, gathering, connecting, connected, closing,
 /** Returns a stable lowercase name for an RtcState value. */
 const char* rtcStateName(RtcState state);
 
+/** Explicit lifecycle of one WebRTC offer's answer. */
+enum class RtcAnswerState : uint8_t { idle, pending, answered, failed };
+
+/** Single-use outcome gate for an RTC offer; the first answer or failure settles it permanently. */
+class RtcAnswerGate {
+ public:
+  /** Opens the gate for one offer, returning false when an offer already started. */
+  bool begin();
+  /** Settles a pending gate with the answer SDP. */
+  void resolve(std::string sdp);
+  /** Settles a pending gate with a failure reason, defaulting to rtc_failed. */
+  void reject(std::string reason);
+  /** Returns the current gate state. */
+  RtcAnswerState state() const;
+  /** True once the gate holds an answer or a failure. */
+  bool settled() const;
+  /** Copies the settled outcome, returning false while the offer is still pending. */
+  bool take(std::string& answer_sdp, std::string& error) const;
+
+ private:
+  RtcAnswerState state_ = RtcAnswerState::idle;
+  std::string answer_sdp_;
+  std::string error_;
+};
+
 /** Engine hooks invoked by RtcSession without coupling to libwebsockets or CaptureEncoder. */
 struct RtcCallbacks {
   std::function<void()> wake;
@@ -41,7 +66,7 @@ class RtcSession {
 
   /** Begins asynchronous ICE gathering off the service thread and wakes on completion. */
   void startOffer(std::string offer_sdp);
-  /** Returns true once gathering finishes, populating either answer_sdp or error. */
+  /** Returns true once the offer settles, populating either answer_sdp or error. */
   bool takeAnswer(std::string& answer_sdp, std::string& error);
   /** Sends a shared Annex B frame once the H.264 track is open, starting on a keyframe. */
   void pushFrame(const std::shared_ptr<const EncodedFrame>& frame, uint32_t generation, uint32_t sequence);
@@ -56,6 +81,8 @@ class RtcSession {
   bool canSendInput() const;
   bool canReceiveClipboard() const;
   bool closed() const;
+  /** True once the peer connection has reached the connected state. */
+  bool everConnected() const;
 
  private:
   struct Impl;
