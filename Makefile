@@ -89,13 +89,15 @@ install: relay-engine
 	install -m 0644 dist/viewer/index.html dist/viewer/viewer.js "$(DESTDIR)$(PREFIX)/lib/relay/viewer/"
 	ln -sfn ../lib/relay/relay-engine "$(DESTDIR)$(PREFIX)/bin/relay-engine"
 
-build/backends: FORCE
+BUILD_OPTIONS = $(strip $(BACKENDS)) HWENC=$(if $(filter 1,$(HWENC)),1,0)
+
+build/options: FORCE
 	mkdir -p build
-	@printf '%s\n' '$(strip $(BACKENDS))' | cmp -s - $@ || printf '%s\n' '$(strip $(BACKENDS))' > $@
+	@printf '%s\n' '$(BUILD_OPTIONS)' | cmp -s - $@ || printf '%s\n' '$(BUILD_OPTIONS)' > $@
 
 FORCE:
 
-relay-engine: $(ENGINE_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/backends
+relay-engine: $(ENGINE_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/options
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) $(ENGINE_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(LDLIBS)
 
 build/color-test: tests/unit/color-test.cpp src/engine/core/color.cpp src/engine/core/color.hpp
@@ -133,14 +135,14 @@ build/input-test: tests/unit/input-test.cpp src/engine/core/input.cpp src/engine
 test-input: build/input-test
 	./build/input-test
 
-build/encoder-state-test: tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
+build/encoder-state-test: tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp) build/options
 	mkdir -p build
 	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/encoder-state-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS)) $(ENCODER_PLATFORM_LIBS)
 
 test-encoder-state: build/encoder-state-test
 	./build/encoder-state-test
 
-build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp)
+build/backend-source-test: tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) $(wildcard src/engine/core/*.hpp) build/options
 	mkdir -p build
 	$(CXX) -Isrc/engine $(CODEC_CPPFLAGS) $(ENCODER_PLATFORM_FLAGS) $(CXXFLAGS) tests/unit/backend-source-test.cpp $(CORE_SRCS) $(ENCODER_PLATFORM_SRCS) -o $@ $(shell pkg-config --cflags --libs $(CODEC_PKGS) libavcodec libavutil libswscale) $(ENCODER_PLATFORM_LIBS)
 
@@ -154,7 +156,7 @@ build/test-viewer/viewer.js:
 	: > build/test-viewer/index.html
 	: > build/test-viewer/viewer.js
 
-build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends
+build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/options
 	mkdir -p build
 	$(CXX) -Isrc/engine $(BACKEND_CPPFLAGS) $(if $(HAS_WAYLAND),-Ibuild/protocols) $(shell pkg-config --cflags $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(shell pkg-config --libs $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(BACKEND_LIBS)
 
