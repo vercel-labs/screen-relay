@@ -6,7 +6,7 @@ import type {
 export const navbarBrand: GeistdocsNavbarBrand = "labs";
 
 export const Logo = () => (
-  <span className="font-semibold text-gray-1000 text-lg leading-none tracking-[-3%]">
+  <span className="shrink-0 whitespace-nowrap font-sans font-semibold text-[24.4px] text-black leading-none tracking-[-0.05em] dark:text-white">
     screen-relay
   </span>
 );
