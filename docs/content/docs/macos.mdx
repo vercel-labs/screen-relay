@@ -67,7 +67,7 @@ To list the IDs, pass one that does not exist, such as `--output 0`. The engine 
 
 ## What you will notice
 
-- The stream uses the display's native pixels, so a Retina display streams at full resolution. A display larger than the 16384-pixel limit is halved until it fits.
+- The stream uses the display's native pixels when they fit H.264 Level 5.2 at `stream.fps` (up to 4096 pixels per axis). Larger displays, such as 5K, 6K, or scaled HiDPI backing stores, scale down proportionally so ordinary browser decoders can decode the stream.
 - The pointer is not part of the video. The viewer shows the browser's own pointer.
 - The frame rate follows the display's refresh rate, up to `stream.fps`. The setting accepts up to 120.
 - If the display's size or position changes, the stream stops with `The display changed from WxH to WxH or moved; restart screen-relay to stream it`. Run `screen-relay up` again.

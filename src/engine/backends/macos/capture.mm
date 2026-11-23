@@ -298,7 +298,8 @@ void CaptureState::fail(const std::string& message) {
 void CaptureState::checkDisplay() {
   try {
     const auto now = findDisplay();
-    if (now.id != display.id || now.width != display.width || now.height != display.height ||
+    if (now.id != display.id || now.native_width != display.native_width || now.native_height != display.native_height ||
+        now.width != display.width || now.height != display.height ||
         !CGRectEqualToRect(now.bounds, display.bounds))
       fail("The display changed from " + std::to_string(display.width) + "x" + std::to_string(display.height) + " to " +
            std::to_string(now.width) + "x" + std::to_string(now.height) + " or moved; restart relay to stream it");

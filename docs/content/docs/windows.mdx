@@ -81,6 +81,6 @@ Remote access works as it does on Linux. See [Remote access](/docs/remote-access
 
 ## Limits
 
-- The engine captures one display at a time: the primary display unless you pass `--output`. A display wider or taller than 16384 pixels is halved until it fits. The streamed size must be 320 to 16384 pixels wide and 240 to 16384 pixels high, with even dimensions.
+- The engine captures one display at a time: the primary display unless you pass `--output`. A display that exceeds H.264 Level 5.2 at `stream.fps` (or 4096 pixels per axis) is halved on the GPU until it fits. The streamed size must be at least 320 by 240 pixels with even dimensions.
 - Windows refuses input to elevated (administrator) windows, and the engine reports that input as not applied.
 - Not supported in this version: running `up` or `run` over SSH, a PC with nobody signed in, Remote Desktop sessions, Windows on ARM, and MSYS2 at a root other than `C:\msys64`.

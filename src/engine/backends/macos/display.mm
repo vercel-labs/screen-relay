@@ -1,5 +1,6 @@
 #include "backends/macos/display.hpp"
 #include "core/capture-source.hpp"
+#include "core/surface-budget.hpp"
 #include <charconv>
 #include <iostream>
 #include <mutex>
@@ -12,15 +13,7 @@ namespace relay {
 namespace macos {
 namespace {
 std::string chosen;
-/// Even stream size in pixels, halved until it fits the maximum frame size.
-std::pair<int, int> streamSize(int width, int height) {
-  width &= ~1; height &= ~1;
-  while (width > max_frame_width || height > max_frame_height) {
-    width = (width / 2) & ~1;
-    height = (height / 2) & ~1;
-  }
-  return {width, height};
-}
+unsigned target_fps = 60;
 }
 Display findDisplay() {
   uint32_t count = 0;
@@ -48,8 +41,13 @@ Display findDisplay() {
         height = int(CGDisplayModeGetPixelHeight(mode));
         CGDisplayModeRelease(mode);
       }
-      const auto size = streamSize(width, height);
-      return {id, bounds, size.first, size.second};
+      const SurfacePlan plan = planSurface(width, height, SurfaceBudget::forFps(target_fps), SurfaceScaleMode::exact);
+      if (!plan.ok()) {
+        throw std::runtime_error("Unsupported display size " + std::to_string(width) + "x" +
+                                 std::to_string(height) + " for H.264 level 5.2 at " +
+                                 std::to_string(target_fps) + " fps");
+      }
+      return {id, bounds, width, height, plan.stream_width, plan.stream_height};
     }
   }
   if (names.empty()) names = "none";
@@ -57,8 +55,9 @@ Display findDisplay() {
                            "; online displays: " + names);
 }
 /// Checks screen capture and event posting permissions, requests each missing one once, and validates --output.
-bool initializeNativeBackend(const std::string& output) {
+bool initializeNativeBackend(const std::string& output, unsigned fps) {
   chosen = output;
+  target_fps = fps ? fps : 60u;
   const bool screen = CGPreflightScreenCaptureAccess();
   const bool input = CGPreflightPostEventAccess();
   if (!screen) {

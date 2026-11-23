@@ -9,7 +9,7 @@
 namespace relay {
 struct Backend {
   const char* name;
-  bool (*initialize)(const std::string& output);
+  bool (*initialize)(const std::string& output, unsigned fps);
   std::unique_ptr<CaptureSource> (*capture)();
   std::unique_ptr<InputBackend> (*input)();
   /// The desktop clipboard, or null when this desktop has none the engine can use.

@@ -1,5 +1,6 @@
 #include "backends/windows/output.hpp"
 #include "core/capture-source.hpp"
+#include "core/surface-budget.hpp"
 #include <cstdio>
 #include <mutex>
 #include <stdexcept>
@@ -8,6 +9,7 @@ namespace relay {
 namespace windows {
 namespace {
 std::string chosen;
+unsigned target_fps = 60;
 std::string narrow(const wchar_t* text) {
   std::string out;
   for (; *text; ++text) out += *text < 128 ? char(*text) : '?';
@@ -15,9 +17,8 @@ std::string narrow(const wchar_t* text) {
 }
 }
 int Output::level() const {
-  int level = 0;
-  while ((width() >> level) > max_frame_width || (height() >> level) > max_frame_height) ++level;
-  return level;
+  const SurfacePlan plan = planSurface(width(), height(), SurfaceBudget::forFps(target_fps), SurfaceScaleMode::power_of_two);
+  return plan.ok() ? int(plan.shift) : 0;
 }
 void check(HRESULT result, const char* action) {
   if (SUCCEEDED(result)) return;
@@ -51,11 +52,12 @@ Output findOutput() {
   throw std::runtime_error(chosen.empty() ? "No primary display is attached to the desktop"
                                           : "Display " + chosen + " not found; attached displays: " + names);
 }
-bool initializeNativeBackend(const std::string& output) {
+bool initializeNativeBackend(const std::string& output, unsigned fps) {
   static std::once_flag once;
   static bool initialized = false;
   std::call_once(once, [&] {
     chosen = output;
+    target_fps = fps ? fps : 60u;
     initialized = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) ||
                   GetLastError() == ERROR_ACCESS_DENIED;
   });

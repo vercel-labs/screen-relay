@@ -98,7 +98,8 @@ The checks also cover `sway`, `swaymsg`, `Xwayland`, and `foot`. Doctor does not
 
 ## Limits
 
-- The display or output must be 320 to 16384 pixels wide and 240 to 16384 pixels high, with even dimensions.
+- The display or output must be 320 to 16384 pixels wide and 240 to 16384 pixels high. `display.resolution` must have even dimensions. An attached display or output with an odd width or height streams at the next smaller even size.
+- The stream uses the display's native pixels when they fit H.264 Level 5.2 at `stream.fps` (up to 4096 pixels per axis). Larger displays scale down proportionally so ordinary browser decoders can decode the stream.
 - On X11, to resize a virtual display, change `display.resolution` and restart screen-relay. For an attached display, resize it separately before restarting screen-relay.
 
 ### Compositors

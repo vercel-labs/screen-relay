@@ -4,6 +4,7 @@
 #include "flow.hpp"
 #include "capture-source.hpp"
 #include "cpu-budget.hpp"
+#include "scaled-capture.hpp"
 #include "wait.hpp"
 
 #include <cstdint>
@@ -242,6 +243,7 @@ struct CaptureEncoder::Impl {
   bool paused = false;
   uint64_t revision = 0;
   bool active = false;
+  int stream_width = 0, stream_height = 0;
   CaptureStats counters;
   void wake() { wake_event.signal(); }
   void run() {
@@ -251,12 +253,21 @@ struct CaptureEncoder::Impl {
       require(validWaitHandle(source->fd()), "invalid capture source fd");
       const auto format = source->pixelFormat();
       require(format == PixelFormat::BGRA || format == PixelFormat::ARGB, "unsupported capture pixel format");
+      SurfacePlan plan;
+      source = fitCaptureSourceToBudget(std::move(source), settings.fps, &plan);
+      if (plan.scaled()) {
+        std::fprintf(stderr, "capture: scaling %dx%d to %dx%d (%s, H.264 level %u.%u at %u fps)\n",
+                     plan.source_width, plan.source_height, plan.stream_width, plan.stream_height,
+                     surfaceFitStateName(plan.state), unsigned(plan.h264_level_idc / 10),
+                     unsigned(plan.h264_level_idc % 10), settings.fps);
+      }
       const auto dimensions = source->dimensions();
       const int width = dimensions.first, height = dimensions.second;
       requireSurfaceSize(width, height);
       Resources r(format, width, height, settings);
       r.init();
       { std::lock_guard<std::mutex> lock(mutex);
+        stream_width = width; stream_height = height;
         counters.cursor_supported = source->cursorSupported(); initialized = true; running = true;
       }
       ready.notify_all();
@@ -545,6 +556,10 @@ void CaptureEncoder::setFlowControl(uint32_t generation, unsigned window, uint64
 CaptureStats CaptureEncoder::stats() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->counters;
+}
+std::pair<int, int> CaptureEncoder::dimensions() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return {impl_->stream_width, impl_->stream_height};
 }
 std::string CaptureEncoder::error() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
