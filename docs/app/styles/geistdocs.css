@@ -35,3 +35,47 @@
 #nd-toc a[data-active="true"] {
   @apply text-gray-1000;
 }
+
+/* Vercel Labs lockup: the wordmark and the product name size from the logo, so
+   neither may be compressed when the header row is tight. */
+header a[aria-label="Vercel Labs"],
+header a[aria-label="Vercel Labs"] svg {
+  flex-shrink: 0;
+}
+
+/* On phones the lockup needs the full width of the header, so the compact
+   Ask AI shortcut steps aside; the regular button returns from 768px. */
+@media (width < 480px) {
+  header .\@min-\[768px\]\:hidden {
+    display: none !important;
+  }
+}
+
+/* Match the OG card's lockup spacing, scaled to the 18px logo: 11.04px from
+   the logo to the slash, then 7.71px from the slash to the product name. */
+header span:has(> a[aria-label="Vercel Labs"]) {
+  gap: 0;
+}
+
+header a[aria-label="Vercel Labs"] + div {
+  align-items: flex-start;
+  display: flex;
+  height: 18px;
+  justify-content: center;
+  margin-left: 11.039px;
+  margin-right: 7.71px;
+  width: 6.22px;
+}
+
+header a[aria-label="Vercel Labs"] + div > svg {
+  display: none;
+}
+
+header a[aria-label="Vercel Labs"] + div::before {
+  background: currentColor;
+  clip-path: polygon(83.0986% 0, 100% 0, 18.3099% 100%, 0 100%);
+  content: "";
+  height: 14.806px;
+  margin-top: 1.464px;
+  width: 6.22px;
+}
