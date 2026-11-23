@@ -115,6 +115,14 @@ RtcAdmission rtcAdmission(size_t wsViewerCount, size_t wsGrantViewerCount,
                        total <= max_viewers && grants <= max_viewers - 1;
   return {replace, replace};
 }
+RtcOfferOutcome classifyRtcOffer(bool settled, bool hasAnswer, bool sessionClosed) {
+  if (settled) return hasAnswer ? RtcOfferOutcome::answered : RtcOfferOutcome::failed;
+  return sessionClosed ? RtcOfferOutcome::failed : RtcOfferOutcome::waiting;
+}
+unsigned rtcOfferErrorStatus(const std::string& error) {
+  return error == "no_h264" || error == "invalid_offer" || error == "invalid_query"
+      ? HTTP_STATUS_BAD_REQUEST : HTTP_STATUS_SERVICE_UNAVAILABLE;
+}
 bool frameMessage(std::vector<uint8_t>& out, size_t pre, uint32_t generation, uint32_t lastSequence, const EncodedFrame& f,
                   uint16_t width, uint16_t height) {
   return frameMessage(out, pre, generation, lastSequence, f.sequence, f, width, height);

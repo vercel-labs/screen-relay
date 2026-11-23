@@ -151,6 +151,10 @@ void Server::closeActiveRtc(size_t index) {
     release();
     if (input) input->cancel();
   }
+  if (active.grant_id) {
+    if (active.session && active.session->everConnected()) grants.commit(active.grant_id);
+    else grants.release(active.grant_id);
+  }
   if (active.session) active.session->close();
 }
 
@@ -632,7 +636,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
           return errorResponse(wsi, response, HTTP_STATUS_METHOD_NOT_ALLOWED, "method_not_allowed");
         }
         if (!localRequest(s->config, wsi)) return errorResponse(wsi, response, HTTP_STATUS_FORBIDDEN, "forbidden");
-        if (!authenticated(s->config, wsi) && !s->grants.find(httpBearer(wsi), Grants::Clock::now())) {
+        if (!authenticated(s->config, wsi) && !s->grants.available(httpBearer(wsi), Grants::Clock::now())) {
           return errorResponse(wsi, response, HTTP_STATUS_UNAUTHORIZED, "unauthorized");
         }
         return jsonResponse(wsi, response, HTTP_STATUS_OK, s->rtcConfigJson());
@@ -648,7 +652,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         Socket requested_socket = Socket::stream;
         const bool caller_is_owner = authenticated(s->config, wsi);
         if (!caller_is_owner) {
-          const auto* grant = s->grants.find(httpBearer(wsi), Grants::Clock::now());
+          const auto* grant = s->grants.available(httpBearer(wsi), Grants::Clock::now());
           if (!grant) return errorResponse(wsi, response, HTTP_STATUS_UNAUTHORIZED, "unauthorized");
           response->grant_id = grant->id;
           if (grant->scope == GrantScope::watch) requested_socket = Socket::watch;
@@ -928,7 +932,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       if (authenticated(s->config, wsi, true)) {
         if (!allowedOrigin(s->config, wsi)) return 1;
       } else {
-        const auto* grant = s->grants.find(websocketBearer(wsi), Grants::Clock::now());
+        const auto* grant = s->grants.available(websocketBearer(wsi), Grants::Clock::now());
         if (!grant || parsed.clipboard || (grant->scope == GrantScope::watch && parsed.socket != Socket::watch)) return 1;
         response->grant_id = grant->id;
       }
@@ -999,7 +1003,9 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
 #ifdef RELAY_RTC
       if (s->rtc.offer.stage == Server::RtcOfferStage::gathering && s->rtc.offer.session) {
         std::string answer, error;
-        if (s->rtc.offer.session->takeAnswer(answer, error)) {
+        const bool settled = s->rtc.offer.session->takeAnswer(answer, error);
+        const RtcOfferOutcome outcome = classifyRtcOffer(settled, !answer.empty() && error.empty(), s->rtc.offer.session->closed());
+        if (outcome != RtcOfferOutcome::waiting) {
           auto finished = std::move(s->rtc.offer.session);
           lws* client = s->rtc.offer.client;
           const bool offer_can_input = s->rtc.offer.can_input;
@@ -1008,19 +1014,20 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
           s->rtc.offer.client = nullptr;
           s->rtc.offer.can_input = false;
           s->rtc.offer.grant_id = 0;
+          if (client) lws_set_timer_usecs(client, LWS_SET_TIMER_USEC_CANCEL);
           auto* response = client ? static_cast<HttpResponse*>(lws_wsi_user(client)) : nullptr;
           const bool grant_expired = offer_grant_id != 0 && !s->grants.active(offer_grant_id, Grants::Clock::now());
           const RtcAdmission admission = s->planRtcAdmission(offer_grant_id);
           const bool generation_exhausted = s->nextGeneration == UINT32_MAX || s->rtc.next_session_id == UINT64_MAX;
-          if (!error.empty() || grant_expired || !admission.allowed || generation_exhausted || !client || !response) {
+          if (outcome == RtcOfferOutcome::failed || grant_expired || !admission.allowed || generation_exhausted || !client || !response) {
             finished->close();
             if (client && response) {
-              const unsigned status = grant_expired ? HTTP_STATUS_UNAUTHORIZED
-                                    : (!admission.allowed || generation_exhausted) ? HTTP_STATUS_SERVICE_UNAVAILABLE
-                                    : HTTP_STATUS_BAD_REQUEST;
               const std::string code = grant_expired ? "unauthorized"
                                      : (!admission.allowed || generation_exhausted) ? "viewer_limit"
                                      : (error.empty() ? "rtc_failed" : error);
+              const unsigned status = grant_expired ? HTTP_STATUS_UNAUTHORIZED
+                                    : (!admission.allowed || generation_exhausted) ? HTTP_STATUS_SERVICE_UNAVAILABLE
+                                    : rtcOfferErrorStatus(code);
               const std::string body = "{\"error\":" + jsonString(code) + "}";
               response->image = new std::vector<uint8_t>(body.begin(), body.end());
               response->image_status = status;
@@ -1028,7 +1035,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
               response->image_headers = false; response->offset = 0;
               lws_callback_on_writable(client);
             }
-          } else if (offer_grant_id != 0 && !s->grants.claim(offer_grant_id)) {
+          } else if (offer_grant_id != 0 && !s->grants.reserve(offer_grant_id)) {
             finished->close();
             const std::string body = "{\"error\":\"unauthorized\"}";
             response->image = new std::vector<uint8_t>(body.begin(), body.end());
@@ -1051,6 +1058,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
             const SubscriberRole role = offer_can_input ? SubscriberRole::rtc : SubscriberRole::watch;
             auto sub = s->hub.attach(role, ++s->nextGeneration, offer_grant_id == 0, std::move(sinks));
             if (!sub) {
+              if (offer_grant_id != 0) s->grants.release(offer_grant_id);
               finished->close();
               const std::string body = "{\"error\":\"capture_unavailable\"}";
               response->image = new std::vector<uint8_t>(body.begin(), body.end());
@@ -1096,6 +1104,7 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       }
       for (size_t i = s->rtc.active.size(); i > 0; --i) {
         auto& active = s->rtc.active[i - 1];
+        if (active.grant_id && active.session->everConnected()) s->grants.commit(active.grant_id);
         if ((active.grant_id && !s->grants.active(active.grant_id, Grants::Clock::now())) || active.session->closed()) {
           s->closeActiveRtc(i - 1);
           continue;
@@ -1163,7 +1172,20 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
       if (s->screenshot_client == wsi) { closeScreenshot(s, wsi, static_cast<HttpResponse*>(user)); return -1; }
 #ifdef RELAY_RTC
       if (s->rtc.offer.client == wsi) {
+        const bool gathering = s->rtc.offer.stage == Server::RtcOfferStage::gathering;
         s->abortPendingRtc(false);
+        if (gathering) {
+          auto* response = static_cast<HttpResponse*>(user);
+          if (response && !response->image) {
+            const std::string body = "{\"error\":\"rtc_timeout\"}";
+            response->image = new std::vector<uint8_t>(body.begin(), body.end());
+            response->image_status = HTTP_STATUS_SERVICE_UNAVAILABLE;
+            response->image_type = "application/json";
+            response->image_headers = false; response->offset = 0;
+            lws_callback_on_writable(wsi);
+            return 0;
+          }
+        }
         return -1;
       }
 #endif
