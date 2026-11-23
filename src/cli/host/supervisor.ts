@@ -346,7 +346,7 @@ export class Session {
     engineCommand.push('--backend', backend);
     if (this.args.encoder && this.args.encoder !== 'auto') engineCommand.push('--encoder', this.args.encoder);
     const iceServersFile = this.args['ice-servers-file'] ?? join(this.dir, 'ice-servers');
-    if (this.args['ice-server']?.length) writePrivateFile(iceServersFile, `${this.args['ice-server'].join('\n')}\n`);
+    if (this.args['ice-server']?.length && !this.args['ice-servers-file']) writePrivateFile(iceServersFile, `${this.args['ice-server'].join('\n')}\n`);
     if (this.args['ice-server']?.length || this.args['ice-servers-file']) engineCommand.push('--ice-servers-file', iceServersFile);
     else rmSync(iceServersFile, { force: true });
     const viewer = join(LAUNCHER_DIR, '..', 'viewer');

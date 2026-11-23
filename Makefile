@@ -98,7 +98,7 @@ install: relay-engine
 
 build/backends: FORCE
 	mkdir -p build
-	@printf '%s\n' '$(strip $(BACKENDS))' | cmp -s - $@ || printf '%s\n' '$(strip $(BACKENDS))' > $@
+	@printf '%s\n' '$(strip $(BACKENDS)) RTC=$(RTC)' | cmp -s - $@ || printf '%s\n' '$(strip $(BACKENDS)) RTC=$(RTC)' > $@
 
 FORCE:
 
@@ -168,11 +168,7 @@ build/test-viewer/viewer.js:
 	: > build/test-viewer/index.html
 	: > build/test-viewer/viewer.js
 
-build/server-test-rtc: FORCE
-	mkdir -p build
-	@printf '%s\n' '$(RTC)' | cmp -s - $@ || printf '%s\n' '$(RTC)' > $@
-
-build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends build/server-test-rtc
+build/server-test: tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(HEADERS) $(WAYLAND_PROTOCOL_HEADERS) $(WAYLAND_PROTOCOL_OBJECTS) build/test-viewer/viewer.js build/backends
 	mkdir -p build
 	$(CXX) -Isrc/engine $(BACKEND_CPPFLAGS) $(if $(HAS_WAYLAND),-Ibuild/protocols) $(RTC_CPPFLAGS) $(shell pkg-config --cflags $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(CXXFLAGS) $(BACKEND_OBJCXXFLAGS) tests/unit/server-test.cpp $(SERVER_TEST_SRCS) $(WAYLAND_PROTOCOL_OBJECTS) -o $@ $(shell pkg-config --libs $(BACKEND_PKGS) $(PLATFORM_PKGS) libwebsockets) $(BACKEND_LIBS) $(RTC_LDLIBS)
 
