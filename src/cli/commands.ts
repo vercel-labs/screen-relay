@@ -120,7 +120,7 @@ export const commands: Record<string, Command> = {
       { description: 'Set up this machine without prompts', command: 'screen-relay install --yes' },
       { description: 'Set up the Wayland backend on Linux', command: 'screen-relay install --backend wayland --yes' },
     ],
-    notes: ['Installs packages with the system package manager, using sudo unless you are root, then builds the engine under ~/.local/share/screen-relay.', 'Safe to repeat. Adding a backend keeps the ones the engine already has.', 'At a terminal it asks before installing packages; anywhere else it needs --yes.'],
+    notes: ['Installs packages with the system package manager, using sudo unless you are root, then builds the engine under ~/.local/share/screen-relay.', 'On Windows, creates C:\\msys64 with its access rules and installs MSYS2 with winget when the folder is absent. It uses an existing folder only when the owner and write rules pass its check and never changes the access rules of an existing installation; if the check fails, delete C:\\msys64 without running any program from it and run install again.', 'Safe to repeat. Adding a backend keeps the ones the engine already has.', 'At a terminal it asks before installing packages; anywhere else it needs --yes.'],
     resultSchema: { install: { backends: 'array', engine: 'string' }, outcome: ['installed', 'unchanged'] },
     run: cmdInstall,
   },

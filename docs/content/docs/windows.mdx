@@ -21,7 +21,42 @@ Install the CLI with `npm install -g screen-relay`, as in [Getting started](/doc
 screen-relay install
 ```
 
-Setup uses MSYS2 at `C:\msys64`. If MSYS2 is missing, setup installs it with winget (`winget install MSYS2.MSYS2`). Without winget, setup stops and asks you to install MSYS2 from https://www.msys2.org. Setup runs MSYS2 only when your account or an administrator owns it and no other account can write to it. A folder at the root of `C:\` inherits a rule that lets every user add files to it, so an MSYS2 that setup installs gets new rules: full control for SYSTEM, Administrators, and your account, and read access for Users. If you installed MSYS2 yourself and only you use it, setup stops and prints an `icacls` command that sets the same rules. Run that command, then run `screen-relay install` again. If another account owns the installation, delete `C:\msys64` and run `screen-relay install` again. Then setup installs `make`, `diffutils`, `mingw-w64-ucrt-x86_64-gcc`, `mingw-w64-ucrt-x86_64-pkgconf`, `mingw-w64-ucrt-x86_64-libwebsockets`, and `mingw-w64-ucrt-x86_64-x264` with pacman, and builds the engine.
+Setup uses MSYS2 at `C:\msys64`. If that folder does not exist, setup creates it with full control for SYSTEM, Administrators, and your account, and read and execute access for Users. It then installs MSYS2 with winget (`winget install MSYS2.MSYS2`). Setup needs permission to create `C:\msys64`; if your account cannot, run the command from an elevated terminal. Without winget, setup stops and asks you to install MSYS2 manually. Setup does not change the access rules of an existing installation; it only adds the packages it needs with pacman. It uses an existing `C:\msys64` only if it passes the access checks; if it does not, setup stops. Do not change or install over an existing tree.
+
+### Install MSYS2 manually
+
+Use an elevated PowerShell window opened as the same Windows account that will run screen-relay. This procedure creates a new, empty `C:\msys64`. If that path already exists, stop; do not change its access rules or install over it.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$root = 'C:\msys64'
+if (Test-Path -LiteralPath $root) {
+  throw 'C:\msys64 already exists. This procedure requires a new directory.'
+}
+New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+if (-not $sid) {
+  throw 'Could not determine the current Windows account SID.'
+}
+& "$env:SystemRoot\System32\icacls.exe" $root /inheritance:r /grant:r `
+  '*S-1-5-18:(OI)(CI)F' `
+  '*S-1-5-32-544:(OI)(CI)F' `
+  "*$($sid):(OI)(CI)F" `
+  '*S-1-5-32-545:(OI)(CI)RX'
+if ($LASTEXITCODE -ne 0) {
+  throw 'icacls failed. Stop and do not run the MSYS2 installer.'
+}
+```
+
+These rules give full control to SYSTEM, Administrators, and the current account, and read and execute access to Users. The rules inherit to files and subdirectories. If the command throws an error or `icacls` returns a nonzero exit code, stop and do not continue with the installer. Download the current GUI installer from the official [MSYS2 installer page](https://www.msys2.org/docs/installer/). From the directory containing the downloaded file, run the installer in install mode with `C:/msys64` as the root, replacing the filename if needed:
+
+```powershell
+.\msys2-x86_64-latest.exe in --confirm-command --accept-messages --root C:/msys64
+```
+
+After installation, run `screen-relay install` again from a terminal in the signed-in user's desktop session.
+
+Setup then installs `make`, `diffutils`, `mingw-w64-ucrt-x86_64-gcc`, `mingw-w64-ucrt-x86_64-pkgconf`, `mingw-w64-ucrt-x86_64-libwebsockets`, and `mingw-w64-ucrt-x86_64-x264` with pacman, and builds the engine.
 
 At a terminal, setup asks before it installs anything. Anywhere else, pass `--yes`. Setup is safe to repeat. On Windows, `--backend` accepts only `windows`.
 
@@ -73,7 +108,7 @@ Quote the name so the shell keeps its backslashes. An unknown name lists the att
 screen-relay doctor
 ```
 
-The checks cover the Windows version, MSYS2, the engine, and whether the command runs in a desktop session. The MSYS2 check fails when another account owns the installation or can write to it.
+The checks cover the Windows version, MSYS2, the engine, and whether the command runs in a desktop session. The MSYS2 check fails when setup cannot verify the installation's owner and write rules.
 
 ## Remote access
 

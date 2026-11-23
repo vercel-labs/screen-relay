@@ -108,7 +108,7 @@ SCREEN_RELAY_BACKEND=wayland screen-relay doctor
 
 - On Linux, doctor checks the `x11` backend unless `SCREEN_RELAY_BACKEND` or the config `backend` key says otherwise.
 - On macOS, doctor checks the macOS version, the engine, and the Screen Recording and Accessibility permissions.
-- On Windows, doctor checks the Windows version, MSYS2, the engine, and whether it runs in a desktop session. The MSYS2 check fails when another account owns the installation or can write to it.
+- On Windows, doctor checks the Windows version, MSYS2, the engine, and whether it runs in a desktop session. The MSYS2 check fails when setup cannot verify the installation's owner and write rules.
 - Failures exit 1. Warnings do not.
 - JSON checks include `name`, `status`, `detail`, and `fix`.
 
@@ -128,7 +128,7 @@ screen-relay install --backend wayland --yes
 | `--yes`, `-y` | Install packages without asking. Required when there is no terminal. |
 
 - Installs packages with the system package manager, using `sudo` unless you are root.
-- On Windows, installs MSYS2 at `C:\msys64` with winget if it is missing, then installs its packages with pacman. Without winget, it stops and asks you to install MSYS2 from https://www.msys2.org. It runs MSYS2 only when your account or an administrator owns the installation and no other account can write to it. After it installs MSYS2, it removes the rules that the folder inherits from `C:\`, which let every user add files.
+- On Windows, creates `C:\msys64` with its access rules and installs MSYS2 with winget when the folder is absent, then installs its packages with pacman. Without winget, it stops; a manual MSYS2 installation must already have the access rules described in the [Windows guide](/docs/windows#install). It uses an existing `C:\msys64` only when the owner and write rules pass its check, and it does not change the access rules of an existing installation; if the check fails, delete `C:\msys64` without running any program from it and run `screen-relay install` again.
 - Builds the engine into `~/.local/share/screen-relay/engine/<version>/`. Builds for earlier versions stay there until deleted.
 - At a terminal, it asks before installing packages. Anywhere else, it needs `--yes`.
 - The outcome is `installed` after it sets something up, or `unchanged` when nothing was missing. Adding a backend keeps the ones the engine already has.
