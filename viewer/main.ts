@@ -1034,7 +1034,11 @@ actions.addEventListener('click', (e) => {
   if (button) toolbarActions[(button as HTMLElement).dataset.action!](button);
 });
 document.addEventListener('fullscreenchange', () => {
-  toolbar.querySelector('[data-action="fullscreen"]')!.setAttribute('aria-pressed', String(Boolean(document.fullscreenElement)));
+  const fullscreen = Boolean(document.fullscreenElement);
+  toolbar.querySelector('[data-action="fullscreen"]')!.setAttribute('aria-pressed', String(fullscreen));
+  const keyboard = (navigator as Navigator & { keyboard?: { lock(codes: string[]): Promise<void>; unlock(): void } }).keyboard;
+  if (fullscreen) keyboard?.lock(['Escape']).catch(() => {});
+  else keyboard?.unlock();
 });
 panels.clipboard.addEventListener('click', (e) => {
   const button = (e.target as Element).closest('[data-clipboard]') as HTMLElement | null;
