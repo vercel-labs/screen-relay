@@ -379,6 +379,10 @@ struct CaptureEncoder::Impl {
               counters.convert_ns += job.convert_ns;
               counters.encode_ns += res.encode_ns;
             }
+            if (!job.refinement) {
+              refining = true;
+              refinements = 0;
+            }
             continue;
           }
 
@@ -735,7 +739,7 @@ void CaptureEncoder::setFlowControl(uint32_t generation, unsigned window, uint64
   std::lock_guard<std::mutex> lock(i.mutex);
   if (i.generation != generation || !i.active) return;
   i.window = std::max(1u, window);
-  i.bitrate = std::clamp(bitrate, i.settings.min_bitrate, i.settings.max_bitrate);
+  i.bitrate = std::clamp<uint64_t>(bitrate, std::max<uint64_t>(1, i.settings.min_bitrate / 4), i.settings.max_bitrate);
   i.paused = paused;
   i.admit_until_us = admit_until_us;
   i.wake();
