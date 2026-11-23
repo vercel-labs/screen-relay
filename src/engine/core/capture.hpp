@@ -36,9 +36,11 @@ class CaptureEncoder {
  public:
   using Publish = std::function<bool(EncodedFrame&&)>;
   using PublishCursor = std::function<void(uint32_t, CursorImage&&)>;
+  /** Called on the capture thread after the source changed size and the encoder reopened; the session is inactive until beginSession. */
+  using Resized = std::function<void()>;
   explicit CaptureEncoder(Publish publish, CaptureSettings settings,
                           CaptureSourceFactory factory,
-                          PublishCursor cursor = {});
+                          PublishCursor cursor = {}, Resized resized = {});
   ~CaptureEncoder();
   CaptureEncoder(const CaptureEncoder&) = delete;
   CaptureEncoder& operator=(const CaptureEncoder&) = delete;

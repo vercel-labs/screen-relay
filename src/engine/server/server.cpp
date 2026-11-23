@@ -77,6 +77,9 @@ backendFor(server.config.backend).capture, [this, &server](uint32_t gen, CursorI
   if (!generation || gen != generation) return;
   pending_cursor = std::move(cursor);
   lws_cancel_service(server.context);
+}, [this, &server] {
+  resized = true;
+  lws_cancel_service(server.context);
 }) {
   const auto& cfg = server.config;
   flow.configure(cfg.bitrate_min, cfg.bitrate_start, cfg.bitrate_max, cfg.fps);
@@ -89,9 +92,19 @@ void Server::Stream::begin(lws* wsi, uint32_t gen) {
   { std::lock_guard<std::mutex> lock(mutex); generation = gen; }
   capture.beginSession(gen);
 }
+void Server::Stream::restart(uint32_t gen) {
+  const auto size = capture.dimensions();
+  { std::lock_guard<std::mutex> lock(mutex);
+    superseded = generation; generation = gen; pending.clear(); pending_cursor.reset(); flow.reset(); failed = false;
+  }
+  last_write_cursor = false;
+  buffered_stream_bytes = 0; flow_timer_due_us = 0;
+  lastSequence = 0; width = uint16_t(size.first); height = uint16_t(size.second);
+  capture.beginSession(gen);
+}
 void Server::Stream::end() {
   uint32_t old;
-  { std::lock_guard<std::mutex> lock(mutex); old = generation; generation = 0; pending.clear(); pending_cursor.reset(); flow.reset(); failed = false; }
+  { std::lock_guard<std::mutex> lock(mutex); old = generation; generation = 0; superseded = 0; pending.clear(); pending_cursor.reset(); flow.reset(); failed = false; }
   last_write_cursor = false;
   buffered_stream_bytes = 0; stream_notsent_lowat = 0; flow_timer_due_us = 0;
   if (old) capture.endSession(old);
@@ -141,7 +154,8 @@ int Server::startStream(lws* wsi, Socket socket, const ConnectionPlan& plan, boo
   if (plan.closeControl) { evict(control); endControl(); }
   if (socket != Socket::watch) { input_viewer = wsi; input->resetLocks(); }
   auto& stream = **slot;
-  stream.width = width; stream.height = height;
+  const auto size = stream.capture.dimensions();
+  stream.width = uint16_t(size.first); stream.height = uint16_t(size.second);
   stream.clipboard_notices = clipboardNotices;
   stream.begin(wsi, ++nextGeneration);
   stream.updateFlow(config.proxy);
@@ -215,7 +229,7 @@ bool Server::streamMessage(Stream& stream) {
     if (accepted) { stream.capture.acknowledge(gen, seq); stream.updateFlow(config.proxy); }
     return true;
   }
-  if (b[5] != 3 || b.size() != 36 || seq || gen != stream.generation) return false;
+  if (b[5] != 3 || b.size() != 36 || seq || (gen != stream.generation && gen != stream.superseded)) return false;
   if (input_viewer != stream.viewer) return true;
   return input->apply(inputEvent(b.data()+20)) != InputStatus::invalid;
 }
@@ -759,6 +773,11 @@ int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t
         if (auto* stream = s->streamFor(s->input_viewer); stream && stream->clipboard_notices) {
           stream->clipboard_pending = true;
         }
+      }
+      for (const auto& stream : s->streams) if (stream && stream->resized.exchange(false)) {
+        const auto size = stream->capture.dimensions();
+        s->width = uint16_t(size.first); s->height = uint16_t(size.second);
+        if (stream->viewer) stream->restart(++s->nextGeneration);
       }
       for (const auto& stream : s->streams) if (stream && stream->viewer) {
         stream->updateFlow(s->config.proxy);

@@ -29,6 +29,7 @@ class ScaledCaptureSource final : public CaptureSource {
 
   WaitHandle fd() const override { return inner_->fd(); }
   std::pair<int, int> dimensions() const override { return {dst_width_, dst_height_}; }
+  bool resized() const override { return inner_->resized(); }
   bool drainDamage() override { return inner_->drainDamage(); }
   PixelFormat pixelFormat() const override { return format_; }
   bool cursorSupported() const override { return inner_->cursorSupported(); }

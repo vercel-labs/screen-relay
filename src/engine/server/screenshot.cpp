@@ -95,6 +95,7 @@ void Screenshot::run(lws_context* context) {
     std::vector<uint8_t> result;
     std::string error;
     try {
+      if (resources && resources->source->resized()) resources.reset();
       if (!resources) {
         resources = std::make_unique<Resources>();
         resources->init(backend, fps);

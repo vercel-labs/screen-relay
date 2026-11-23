@@ -63,13 +63,16 @@ struct Server {
     uint32_t stream_notsent_lowat = 0;
     uint64_t flow_timer_due_us = 0;
     FlowControl flow;
-    uint32_t generation = 0, lastSequence = 0;
+    uint32_t generation = 0, superseded = 0, lastSequence = 0;
     uint16_t width = 0, height = 0;
     bool failed = false;
+    std::atomic<bool> resized{false};
     std::vector<uint8_t> received;
     CaptureEncoder capture;
     explicit Stream(Server& server);
     void begin(lws* wsi, uint32_t gen);
+    /** Starts generation gen on the open connection at the capture's new size. */
+    void restart(uint32_t gen);
     void end();
     void updateFlow(bool proxy);
     bool timedOut();

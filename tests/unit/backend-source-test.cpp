@@ -23,6 +23,7 @@ struct SourceState {
   relay::Wake wake;
   std::atomic<unsigned> captures{0};
   std::atomic<bool> red{false};
+  std::atomic<int> width{0}, height{0};
   int invalid = 0;
   SourceState() { require(wake.valid(), "damage wake unavailable"); }
   void damage() { wake.signal(); }
@@ -37,6 +38,7 @@ class CpuSource final : public relay::CaptureSource {
       : state(std::move(s)), width(w), height(h), pixels(size_t(w) * size_t(h) * 4) {}
   relay::WaitHandle fd() const override { return state->wake.handle(); }
   std::pair<int, int> dimensions() const override { return {width, height}; }
+  bool resized() const override { return state->width && (state->width != width || state->height != height); }
   bool drainDamage() override { return state->wake.consume(); }
   relay::PixelFormat pixelFormat() const override { return relay::PixelFormat::BGRA; }
   relay::FrameView capture() override {
@@ -133,6 +135,42 @@ static void healthySource() {
   require(state->captures == stopped, "capture continued after shutdown");
   require(encoder.error().empty(), "healthy source produced fatal error");
 }
+static void waitFor(const std::atomic<unsigned>& counter, unsigned value, const char* message) {
+  for (int i = 0; i < 300 && counter < value; ++i) std::this_thread::sleep_for(10ms);
+  require(counter >= value, message);
+}
+static void sourceResize() {
+  auto state = std::make_shared<SourceState>(); Frames frames;
+  state->width = 1280; state->height = 720;
+  std::atomic<unsigned> resizes{0};
+  relay::CaptureEncoder encoder([&](relay::EncodedFrame&& f) { return frames.publish(std::move(f)); },
+      capture_settings,
+      [state] { return std::make_unique<CpuSource>(state, state->width, state->height); }, {},
+      [&] { ++resizes; });
+  std::string error;
+  require(encoder.start(error), error.c_str());
+  encoder.beginSession(17);
+  const auto initial = frames.at(0);
+  require(initial.generation == 17 && initial.keyframe && initial.width == 1280 && initial.height == 720,
+          "initial session did not start at the source size");
+  encoder.acknowledge(17, 1);
+  state->width = 1920; state->height = 1080; state->damage();
+  waitFor(resizes, 1, "resize was not reported");
+  require(encoder.dimensions() == std::make_pair(1920, 1080), "encoder kept the old size");
+  std::this_thread::sleep_for(100ms);
+  require(frames.items.size() == 1, "frame published before the new generation began");
+  encoder.beginSession(18);
+  const auto resized = frames.at(1);
+  require(resized.generation == 18 && resized.sequence == 1 && resized.keyframe &&
+          resized.width == 1920 && resized.height == 1080, "new generation did not start with a keyframe at the new size");
+  decodedPixel(resized, false, 1920, 1080);
+  encoder.acknowledge(18, 1);
+  state->width = 200; state->damage();
+  for (int i = 0; i < 300 && encoder.error().empty(); ++i) std::this_thread::sleep_for(10ms);
+  require(encoder.error().find("Unsupported root size 200x1080") != std::string::npos,
+          "unsupported resize did not report the size");
+  encoder.stop();
+}
 static void runtimeSize(int width, int height, unsigned fps = 60) {
   auto state = std::make_shared<SourceState>(); Frames frames;
   auto settings = capture_settings;
@@ -212,6 +250,7 @@ class StripeSource final : public relay::CaptureSource {
   static int shade(int y) { return 40 + (y / 16) * 37 % 176; }
   relay::WaitHandle fd() const override { return state->wake.handle(); }
   std::pair<int, int> dimensions() const override { return {width, height}; }
+  bool resized() const override { return state->width && (state->width != width || state->height != height); }
   bool drainDamage() override { return state->wake.consume(); }
   relay::PixelFormat pixelFormat() const override { return relay::PixelFormat::BGRA; }
   relay::FrameView capture() override {
@@ -291,7 +330,7 @@ static void scaledSurfaceFitsLevel52(int width, int height, unsigned fps) {
 }
 int main() {
   try {
-    healthySource(); runtimeSize(1920, 1080); runtimeSize(1366, 768); runtimeSize(3840, 2160);
+    healthySource(); sourceResize(); runtimeSize(1920, 1080); runtimeSize(1366, 768); runtimeSize(3840, 2160);
     runtimeSize(1280, 720, 120);
     scaledSurfaceFitsLevel52(6016, 3384, 60);
     scaledSurfaceFitsLevel52(3008, 1692, 120);
