@@ -563,7 +563,7 @@ async function negotiate(peer: RTCPeerConnection): Promise<string> {
       done();
     });
   });
-  const answer = await fetch('/rtc', {
+  const answer = await fetch(viewOnly ? '/rtc?view=1' : '/rtc', {
     method: 'POST', cache: 'no-store', redirect: 'error', body: peer.localDescription!.sdp,
     headers: { 'content-type': 'application/sdp', ...authHeaders() }, signal: AbortSignal.timeout(10000),
   });
