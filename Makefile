@@ -8,9 +8,10 @@ PLATFORM_PKGS = openssl
 endif
 BACKENDS ?= x11
 HAS_WAYLAND = $(filter wayland,$(BACKENDS))
-AVAILABLE_BACKENDS = x11 wayland windows macos
+AVAILABLE_BACKENDS = x11 wayland windows macos android
 BACKEND_PKGS_x11 = x11 xext xdamage xfixes xtst
 BACKEND_DIR_x11 = linux/x11
+BACKEND_DIR_android = linux/android
 BACKEND_PKGS_wayland = wayland-client xkbcommon
 BACKEND_DIR_wayland = linux/wayland
 BACKEND_DIR_windows = windows
