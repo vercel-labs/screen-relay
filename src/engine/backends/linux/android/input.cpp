@@ -15,7 +15,7 @@ namespace relay::android {
 namespace {
 
 std::pair<uint16_t, uint16_t> configuredSize() {
-  uint16_t w = 360, h = 680;
+  uint16_t w = 720, h = 1520;
   if (const char* env = std::getenv("RELAY_ANDROID_SIZE")) {
     int pw = 0, ph = 0;
     if (std::sscanf(env, "%dx%d", &pw, &ph) == 2 && pw >= 320 && ph >= 240) {
@@ -192,8 +192,8 @@ class AndroidInputBackend final : public InputBackend {
     return ::write(fifo_fd_, line, len) == static_cast<ssize_t>(len);
   }
 
-  uint16_t width_ = 360, height_ = 680;
-  int x_ = 180, y_ = 340;
+  uint16_t width_ = 720, height_ = 1520;
+  int x_ = 360, y_ = 760;
   bool down_ = false;
   int fifo_fd_ = -1;
   std::string fifo_path_;

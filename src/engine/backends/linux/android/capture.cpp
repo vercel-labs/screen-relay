@@ -170,6 +170,10 @@ class AndroidCaptureSource final : public CaptureSource {
     if (pending_settle_ && cur_px_ && (nowMs() - last_present_ms_ >= 35)) {
       swizzleRgbaToBgra(cur_px_, ready_buf_.data(), total);
       pending_settle_ = false;
+      has_frame_ = true;
+    }
+    if (!has_frame_) {
+      return FrameView{nullptr, 0, 0, 0, PixelFormat::BGRA};
     }
     std::memcpy(front_buf_.data(), ready_buf_.data(), front_buf_.size());
     return FrameView{front_buf_.data(), width_ * 4, width_, height_, PixelFormat::BGRA};
@@ -266,6 +270,7 @@ class AndroidCaptureSource final : public CaptureSource {
               swizzleRgbaToBgra(prev_to_copy, scratch.data(), total);
               std::lock_guard<std::mutex> lock(mtx_);
               ready_buf_.swap(scratch);
+              has_frame_ = true;
             }
           } else {
             ::close(fd);
@@ -290,6 +295,7 @@ class AndroidCaptureSource final : public CaptureSource {
   const uint8_t* cur_px_ = nullptr;
   uint64_t last_present_ms_ = 0;
   bool pending_settle_ = false;
+  bool has_frame_ = false;
   std::vector<uint8_t> ready_buf_;
   std::vector<uint8_t> front_buf_;
   std::thread worker_;
