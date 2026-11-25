@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -141,6 +142,7 @@ class AndroidCaptureSource final : public CaptureSource {
 
   ~AndroidCaptureSource() override {
     stop_.store(true);
+    frame_cv_.notify_all();
     if (sock_fd_ >= 0) ::shutdown(sock_fd_, SHUT_RDWR);
     if (worker_.joinable()) worker_.join();
     std::lock_guard<std::mutex> lock(mtx_);
@@ -164,10 +166,17 @@ class AndroidCaptureSource final : public CaptureSource {
 
   FrameView capture() override {
     const size_t total = static_cast<size_t>(width_) * height_;
-    std::lock_guard<std::mutex> lock(mtx_);
-    // When animation settles (>35ms since last present), latch the latest buffer once
-    // so the final resting frame is always displayed completely rendered (SwiftShader takes ~20-26ms).
-    if (pending_settle_ && cur_px_ && (nowMs() - last_present_ms_ >= 35)) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (!has_frame_ && !cur_px_) {
+      frame_cv_.wait_for(lock, std::chrono::milliseconds(1500),
+                         [this] { return stop_.load() || has_frame_ || cur_px_ != nullptr; });
+    }
+    // When animation settles (>35ms since last present), or on the very first frame,
+    // latch the latest buffer so fresh screenshots never return an empty frame.
+    if (pending_settle_ && cur_px_ && (!has_frame_ || nowMs() - last_present_ms_ >= 35)) {
+      if (!has_frame_) {
+        waitForSwiftShaderStable(cur_px_, width_, height_, last_present_ms_);
+      }
       swizzleRgbaToBgra(cur_px_, ready_buf_.data(), total);
       pending_settle_ = false;
       has_frame_ = true;
@@ -263,6 +272,7 @@ class AndroidCaptureSource final : public CaptureSource {
                 cur_px_ = px;
                 last_present_ms_ = nowMs();
                 pending_settle_ = true;
+                frame_cv_.notify_all();
               }
             }
             if (prev_to_copy) {
@@ -271,6 +281,7 @@ class AndroidCaptureSource final : public CaptureSource {
               std::lock_guard<std::mutex> lock(mtx_);
               ready_buf_.swap(scratch);
               has_frame_ = true;
+              frame_cv_.notify_all();
             }
           } else {
             ::close(fd);
@@ -291,6 +302,7 @@ class AndroidCaptureSource final : public CaptureSource {
   std::atomic<bool> stop_{false};
   std::string sock_path_;
   std::mutex mtx_;
+  std::condition_variable frame_cv_;
   std::unordered_map<uint64_t, MappedBuf> cache_;
   const uint8_t* cur_px_ = nullptr;
   uint64_t last_present_ms_ = 0;
