@@ -1,19 +1,19 @@
 ---
 title: Linux
-description: Install, start, and attach to X11 or Wayland desktops on Linux.
+description: Install, start, and attach to X11, Wayland, or headless Android displays on Linux.
 ---
 
-Linux has two backends: `x11`, the default, and `wayland`. Choose one with `--backend`. X11 with XFCE is set up on every distribution that screen-relay installs packages on.
+Linux has three backends: `x11` (the default), `wayland`, and `android`. Choose one with `--backend`. X11 with XFCE is set up on every distribution that screen-relay installs packages on.
 
 <Video src="/demos/linux.mp4" light="/demos/linux.jpg" previewAriaLabel="Play the Linux demo" playing muted loop playsInline />
 
-| | X11 | Wayland |
-| --- | --- | --- |
-| Default | Yes. `up` uses X11 when the engine includes it, otherwise Wayland. | No. Use `--backend wayland`. |
-| Virtual display | A virtual X display | A headless sway desktop |
-| Default desktop | XFCE | The foot terminal, on headless sway with XWayland |
-| Attaches to | An existing X display, with `--display` | A running wlroots-based compositor, with `--display "$WAYLAND_DISPLAY"` |
-| `--output` | No. `--output` is available only with Wayland. | Yes, to choose an output by name |
+| | X11 | Wayland | Android |
+| --- | --- | --- | --- |
+| Default | Yes. `up` uses X11 when the engine includes it, otherwise Wayland. | No. Use `--backend wayland`. | No. Build with `BACKENDS=android` and pass `--backend android`. |
+| Virtual display | A virtual X display | A headless sway desktop | Headless Android container (`hwcomposer.sock` `memfd` frames) |
+| Default desktop | XFCE | The foot terminal, on headless sway with XWayland | Managed by the Android container |
+| Attaches to | An existing X display, with `--display` | A running wlroots-based compositor, with `--display "$WAYLAND_DISPLAY"` | `RELAY_ANDROID_SOCK` (default `/tmp/ipc/hwcomposer.sock`) |
+| `--output` | No. `--output` is available only with Wayland. | Yes, to choose an output by name | No |
 
 ## Install
 
@@ -117,3 +117,31 @@ Wayland works with these compositors:
 - The output's size is fixed for the session. Restart screen-relay after changing it.
 - The cursor image is not streamed. The viewer shows its own arrow.
 - The clipboard needs the `wlr-data-control` protocol, which sway and labwc provide. Without it, the session works and `capabilities.clipboard` is `false`.
+
+## Android
+
+The `android` backend streams headless Android containers on Linux (`x86_64` and `arm64`) without X11, Wayland, or `/dev/uinput`.
+
+<Video src="/demos/android.mp4" light="/demos/android.jpg" previewAriaLabel="Play the Android demo" playing muted loop playsInline />
+
+### Build and run
+
+```sh
+make BACKENDS=android relay-engine
+RELAY_ANDROID_SIZE=720x1520 ./relay-engine --backend android
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RELAY_ANDROID_SOCK` | `/tmp/ipc/hwcomposer.sock` | UNIX socket receiving `memfd` RGBA frames from `hwcomposer` |
+| `RELAY_ANDROID_SIZE` | `720x1520` | Even `WIDTHxHEIGHT` matching the Android display surface |
+| `RELAY_ANDROID_INPUT_FIFO` | `/tmp/ipc/input.fifo` | Mode `0600` FIFO inside an engine-owned, non-world-writable directory for `D/M/U/K/T/W` input events |
+
+### Android limits
+
+- `capture.cpp` swizzles RGBA to BGRA with AVX2 on `x86_64`, NEON (`vqtbl1q_u8`) on `arm64`, or a scalar fallback, and uses adaptive scanline settle detection to avoid tearing when `hwcomposer` presents before software rendering completes.
+- `input.cpp` fails closed if the parent directory of `RELAY_ANDROID_INPUT_FIFO` is world-writable, owned by another UID, or if the FIFO path is a symlink or non-FIFO.
+- Clipboard sync is not implemented (`capabilities.clipboard` is `false`).
+
