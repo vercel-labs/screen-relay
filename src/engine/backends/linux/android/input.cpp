@@ -1,4 +1,5 @@
 #include "core/input.hpp"
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -62,7 +63,6 @@ class AndroidInputBackend final : public InputBackend {
     width_ = w;
     height_ = h;
     fifo_path_ = configuredFifoPath();
-    (void)::mkfifo(fifo_path_.c_str(), 0600);
   }
 
   ~AndroidInputBackend() override {
@@ -142,10 +142,43 @@ class AndroidInputBackend final : public InputBackend {
  private:
   bool ensureOpen() {
     if (fifo_fd_ >= 0) return true;
-    (void)::mkfifo(fifo_path_.c_str(), 0666);
-    (void)::chmod(fifo_path_.c_str(), 0666);
-    fifo_fd_ = ::open(fifo_path_.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    return fifo_fd_ >= 0;
+    const size_t slash = fifo_path_.find_last_of('/');
+    if (slash == std::string::npos || slash + 1 >= fifo_path_.size()) return false;
+    const std::string dir_path = slash == 0 ? "/" : fifo_path_.substr(0, slash);
+    const std::string base_name = fifo_path_.substr(slash + 1);
+    if (base_name == "." || base_name == "..") return false;
+
+    const uid_t euid = ::geteuid();
+    const int dir_fd = ::open(dir_path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0) return false;
+
+    struct stat dir_st {};
+    if (::fstat(dir_fd, &dir_st) != 0 || dir_st.st_uid != euid || (dir_st.st_mode & S_IWOTH) != 0) {
+      ::close(dir_fd);
+      return false;
+    }
+
+    if (::mkfifoat(dir_fd, base_name.c_str(), 0600) != 0 && errno != EEXIST) {
+      ::close(dir_fd);
+      return false;
+    }
+
+    const int fd = ::openat(dir_fd, base_name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    ::close(dir_fd);
+    if (fd < 0) return false;
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode) || st.st_uid != euid) {
+      ::close(fd);
+      return false;
+    }
+    if (::fchmod(fd, 0600) != 0) {
+      ::close(fd);
+      return false;
+    }
+
+    fifo_fd_ = fd;
+    return true;
   }
 
   bool sendLine(const char* line) {
